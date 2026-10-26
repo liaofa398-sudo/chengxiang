@@ -417,6 +417,43 @@ def require_task_project_scope(project_id):
         raise PermissionError(f"项目未登记：{project_id}") from exc
 
 
+def reject_symlink_components(root, relative_path):
+    """
+    拒绝路径中的符号链接别名，避免审批显示的路径与实际操作目标不一致。
+    root 应是 safe_project_path 返回的已解析项目根目录。
+    """
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    if not isinstance(relative_path, str) or not relative_path.strip():
+        raise PermissionError("拒绝空白或无效的目标路径。")
+
+    normalized = relative_path.replace("\\", "/").strip()
+    posix_path = PurePosixPath(normalized)
+    windows_path = PureWindowsPath(relative_path)
+
+    if posix_path.is_absolute() or windows_path.is_absolute() or windows_path.drive:
+        raise PermissionError("只允许使用项目内相对路径。")
+    if ".." in posix_path.parts or ".." in windows_path.parts:
+        raise PermissionError("禁止使用 .. 越界访问项目目录。")
+
+    candidate = root
+    for component in posix_path.parts:
+        if component in ("", "."):
+            continue
+        candidate = candidate / component
+        try:
+            if candidate.is_symlink():
+                raise PermissionError(
+                    f"拒绝通过符号链接访问项目路径：{relative_path}"
+                )
+        except OSError as exc:
+            raise PermissionError(
+                f"无法安全检查目标路径：{relative_path}"
+            ) from exc
+
+    return candidate
+
+
 def get_local_project_root(project_id):
     project = get_registered_project(project_id)
     path = safe_project_path(project)
@@ -451,6 +488,8 @@ def read_file(project_id, relative_path, start_line=None, end_line=None, max_byt
 
     root = get_local_project_root(project_id)
 
+    # 先检查原始路径的每一级，拒绝符号链接别名，再解析最终路径。
+    reject_symlink_components(root, relative_path)
     target = (root / relative_path).resolve()
 
     try:
@@ -1525,6 +1564,8 @@ def modify_file(project_id, relative_path, old_text, new_text):
         raise PermissionError(
             f"项目 {project_id} 没有可用的本地工作区：{exc}"
         ) from exc
+    # 即使链接最终仍在项目内，也拒绝通过符号链接改写另一文件。
+    reject_symlink_components(root, normalized)
     target = (root / normalized).resolve()
 
     try:
