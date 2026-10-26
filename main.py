@@ -483,12 +483,12 @@ def get_local_project_root(project_id):
 
     if not path.exists():
         raise FileNotFoundError(
-            f"项目路径不存在：{path}"
+            "登记的项目路径不存在。"
         )
 
     if not path.is_dir():
         raise ValueError(
-            f"项目路径不是目录：{path}"
+            "登记的项目路径不是目录。"
         )
 
     return path
@@ -857,12 +857,13 @@ def read_project(project_id):
             result["git_status"] = {
                 "returncode": completed.returncode,
                 "output": completed.stdout[:10000],
-                "error": completed.stderr[:2000]
+                # 不回显 Git stderr 原文，避免异常信息带出本机绝对路径。
+                "stderr_present": bool(completed.stderr.strip())
             }
 
         except Exception as e:
             result["git_status"] = {
-                "error": str(e)
+                "error_type": type(e).__name__
             }
 
     return result
