@@ -1,0 +1,16 @@
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+*.token
+secrets.json
+credentials.json
+audit.jsonl
+*.bak
+*.before_*
+__pycache__/
+*.py[cod]
+.venv/
+venv/

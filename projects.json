@@ -1,0 +1,31 @@
+{
+  "projects": {
+    "yuni": {
+      "name": "予你",
+      "type": "web_app",
+      "workspace": "github_codespace",
+      "status": "active",
+      "repository": "yuni",
+      "path": null,
+      "description": "AI companion web app"
+    },
+    "whale-bot": {
+      "name": "鲸鱼娘",
+      "type": "qq_bot",
+      "workspace": "termux",
+      "status": "active",
+      "repository": null,
+      "path": null,
+      "description": "Termux QQ AI bot"
+    },
+    "chengxiang": {
+      "name": "丞相中枢",
+      "type": "orchestrator",
+      "workspace": "termux",
+      "status": "active",
+      "repository": null,
+      "path": null,
+      "description": "中央调度与权限编排系统"
+    }
+  }
+}
