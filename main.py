@@ -1284,28 +1284,50 @@ def parse_tool_plan(content):
 
             # 中央硬规则：大文件禁止整文件读取，必须使用行范围。
             if "start_line" not in args and "end_line" not in args:
-                projects = load_projects()
+                # 规划阶段只允许在项目根目录内检查文件大小；
+                # 不对越界路径、符号链接逃逸或敏感目标执行 stat。
                 project = projects.get(project_id)
-
                 if not project:
                     raise PermissionError(
                         f"未知项目：{project_id}"
                     )
 
-                project_path = project.get("path")
+                project_root = safe_project_path(project)
+                relative_path = args["relative_path"]
 
-                if project_path:
-                    target = (
-                        Path(project_path).expanduser()
-                        / args["relative_path"]
-                    )
+                if not isinstance(relative_path, str) or not relative_path.strip():
+                    raise ValueError("read_file 的 relative_path 必须是非空字符串。")
+
+                if project_root is not None:
+                    target = (project_root / relative_path).resolve()
+
+                    try:
+                        resolved_relative = target.relative_to(project_root)
+                    except ValueError:
+                        raise PermissionError(
+                            "规划阶段拒绝检查项目目录之外的文件。"
+                        )
+
+                    for component in resolved_relative.parts:
+                        name_part = component.lower()
+                        if (
+                            name_part == ".git"
+                            or name_part in FORBIDDEN_READ_NAMES
+                            or any(
+                                name_part.endswith(suffix)
+                                for suffix in FORBIDDEN_READ_SUFFIXES
+                            )
+                        ):
+                            raise PermissionError(
+                                "规划阶段拒绝检查敏感路径的文件大小。"
+                            )
 
                     if target.exists() and target.is_file():
                         size = target.stat().st_size
 
                         if size > 30000:
                             raise PermissionError(
-                                f"文件过大：{args['relative_path']} "
+                                f"文件过大：{relative_path} "
                                 f"({size} bytes)。"
                                 "超过 30000 bytes，"
                                 "必须使用 start_line/end_line 分段读取。"
