@@ -2267,12 +2267,25 @@ def main():
 5. 如果不需要继续调用工具，输出：
 TOOL_PLAN_JSON: {{"tools":[]}}
 """
-                analysis = call_deepseek(
-                    followup_prompt,
-                    thinking_enabled=False
-                )
-                next_plan = parse_tool_plan(analysis)
-                show_tool_plan(next_plan)
+                try:
+                    analysis = call_deepseek(
+                        followup_prompt,
+                        thinking_enabled=False
+                    )
+                    next_plan = parse_tool_plan(analysis)
+                    show_tool_plan(next_plan)
+                except Exception as exc:
+                    # 只读结果已返回，但后续分析/计划解析失败时，
+                    # 不让异常冲出交互主循环；同时清理本轮任务状态。
+                    clear_authorization()
+                    CURRENT_TOOL_PLAN = []
+                    STATE = "IDLE"
+                    reset_current_task()
+                    print(
+                        "⚠️ 只读结果已取得，但后续分析失败；"
+                        f"本轮状态已清理：{type(exc).__name__}: {exc}"
+                    )
+                    continue
 
                 if next_plan:
                     CURRENT_TOOL_PLAN = next_plan
