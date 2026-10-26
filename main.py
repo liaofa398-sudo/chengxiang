@@ -336,6 +336,33 @@ def get_registered_project(project_id):
     return projects[project_id]
 
 
+def require_task_project_scope(project_id):
+    """
+    将工具调用绑定到皇帝当前明确指定的单一项目。
+    未明确项目或试图跨项目时一律拒绝；提示词不是安全边界。
+    """
+    if not isinstance(project_id, str) or not project_id:
+        raise PermissionError("拒绝执行：项目 ID 无效。")
+
+    task_project_id = CURRENT_TASK.get("project_id")
+    if not task_project_id:
+        raise PermissionError(
+            "拒绝执行：当前任务尚未绑定明确项目。"
+            "请在任务描述中写出已登记的项目 ID 或项目名称。"
+        )
+
+    if project_id != task_project_id:
+        raise PermissionError(
+            f"拒绝跨项目操作：当前任务绑定 {task_project_id}，"
+            f"工具请求的是 {project_id}。"
+        )
+
+    try:
+        get_registered_project(project_id)
+    except ValueError as exc:
+        raise PermissionError(f"项目未登记：{project_id}") from exc
+
+
 def get_local_project_root(project_id):
     project = get_registered_project(project_id)
     path = safe_project_path(project)
@@ -366,6 +393,7 @@ def read_file(project_id, relative_path, start_line=None, end_line=None, max_byt
     start_line / end_line 均为 1-based，包含首尾。
     """
     require_permission("read")
+    require_task_project_scope(project_id)
 
     root = get_local_project_root(project_id)
 
@@ -420,51 +448,63 @@ def read_file(project_id, relative_path, start_line=None, end_line=None, max_byt
             raise ValueError("单次最多读取 500 行。")
 
     size = target.stat().st_size
+    has_line_range = start_line is not None or end_line is not None
+
+    # 无行范围时，先检查大小，再读取，避免先把超大文件整体载入内存。
+    if not has_line_range and size > max_bytes:
+        raise ValueError(
+            f"文件过大：{relative_path} ({size} bytes)，"
+            f"单次最多读取 {max_bytes} bytes。"
+        )
 
     try:
+        if has_line_range:
+            selected = []
+            selected_bytes = 0
+            total_lines = 0
+
+            # 逐行读取，只保留请求范围；不把整个文件读入内存。
+            with target.open("r", encoding="utf-8", errors="replace") as source:
+                for line_number, line in enumerate(source, 1):
+                    total_lines = line_number
+                    if start_line <= line_number <= end_line:
+                        line = line.rstrip("\r\n")
+                        line_bytes = len(line.encode("utf-8"))
+                        added_bytes = line_bytes + (1 if selected else 0)
+                        if selected_bytes + added_bytes > max_bytes:
+                            raise ValueError(
+                                f"指定行范围过大，单次最多返回 {max_bytes} bytes。"
+                            )
+                        selected.append(line)
+                        selected_bytes += added_bytes
+
+            if start_line > total_lines:
+                raise ValueError(
+                    f"start_line 超出文件范围：文件共 {total_lines} 行。"
+                )
+
+            actual_end_line = min(end_line, total_lines)
+            result_content = "\n".join(selected)
+
+            return {
+                "project": project_id,
+                "status": "ok",
+                "file": relative_path,
+                "start_line": start_line,
+                "end_line": actual_end_line,
+                "total_lines": total_lines,
+                "bytes": len(result_content.encode("utf-8")),
+                "content": result_content
+            }
+
         content = target.read_text(
             encoding="utf-8",
             errors="replace"
         )
     except OSError as e:
         raise RuntimeError(
-            f"读取文件失败：{e}"
-        )
-
-    if start_line is not None or end_line is not None:
-        lines = content.splitlines()
-
-        if start_line > len(lines):
-            raise ValueError(
-                f"start_line 超出文件范围：文件共 {len(lines)} 行。"
-            )
-
-        end_line = min(end_line, len(lines))
-
-        selected = lines[start_line - 1:end_line]
-        result_content = "\n".join(selected)
-
-        if len(result_content.encode("utf-8")) > max_bytes:
-            raise ValueError(
-                f"指定行范围过大，单次最多返回 {max_bytes} bytes。"
-            )
-
-        return {
-            "project": project_id,
-            "status": "ok",
-            "file": relative_path,
-            "start_line": start_line,
-            "end_line": end_line,
-            "total_lines": len(lines),
-            "bytes": len(result_content.encode("utf-8")),
-            "content": result_content
-        }
-
-    if size > max_bytes:
-        raise ValueError(
-            f"文件过大：{relative_path} ({size} bytes)，"
-            f"单次最多读取 {max_bytes} bytes。"
-        )
+            f"读取文件失败：{type(e).__name__}"
+        ) from e
 
     return {
         "project": project_id,
@@ -482,6 +522,7 @@ def search_project(project_id, keyword, max_results=50):
     自动跳过敏感文件、Git、依赖目录和虚拟环境。
     """
     require_permission("read")
+    require_task_project_scope(project_id)
 
     root = get_local_project_root(project_id)
 
@@ -573,6 +614,7 @@ def read_project(project_id):
     - 不修改任何内容
     """
     require_permission("read")
+    require_task_project_scope(project_id)
 
     projects = load_projects()
 
@@ -597,33 +639,42 @@ def read_project(project_id):
         return {
             "project": project_id,
             "status": "path_missing",
-            "path": str(path),
             "message": "登记路径不存在。"
         }
 
     result = {
         "project": project_id,
         "status": "ok",
-        "path": str(path),
         "entries": [],
         "git_status": None
     }
 
-    # 只读取一级目录
+    # 只列出非敏感的一级条目，不暴露绝对路径或敏感文件名。
     try:
         entries = sorted(
             path.iterdir(),
             key=lambda p: (not p.is_dir(), p.name.lower())
         )
 
-        for entry in entries[:200]:
+        visible_count = 0
+        for entry in entries:
+            if visible_count >= 200:
+                break
+            if entry.is_symlink():
+                continue
+            if entry.name.lower() in IGNORED_SEARCH_DIRS:
+                continue
+            if is_forbidden_read(entry):
+                continue
+
             result["entries"].append({
                 "name": entry.name,
                 "type": "directory" if entry.is_dir() else "file"
             })
+            visible_count += 1
 
     except OSError as e:
-        result["directory_error"] = str(e)
+        result["directory_error"] = type(e).__name__
 
     # Git 状态：只读 subprocess
     git_dir = path / ".git"
@@ -975,14 +1026,10 @@ TASK_ASSESSMENT_JSON: {{"goal":"任务目标","success_criteria":["成功标准"
             )
 
     except urllib.error.HTTPError as e:
-        body = e.read().decode(
-            "utf-8",
-            errors="replace"
-        )
-
+        # 不把远端错误正文原样回显，避免意外暴露请求/服务端敏感信息。
         raise RuntimeError(
-            f"DeepSeek API HTTP {e.code}: {body[:500]}"
-        )
+            f"DeepSeek API HTTP {e.code}。请检查服务状态与配置，不要粘贴密钥。"
+        ) from e
 
     except urllib.error.URLError as e:
         raise RuntimeError(
@@ -1155,21 +1202,21 @@ def parse_tool_plan(content):
         if name not in ALLOWED_TOOLS:
             raise PermissionError(f"未知工具：{name}")
 
-        if name == "modify_file":
-            if set(args.keys()) != {"relative_path", "old_text", "new_text"}:
-                raise PermissionError(
-                    "modify_file 参数必须且只能是：relative_path、old_text、new_text"
-                )
-        elif name in ALLOWED_READ_TOOLS:
-            pass
+        if not isinstance(args, dict):
+            raise ValueError("工具参数格式错误。")
 
         if project_id not in projects:
             raise PermissionError(
                 f"项目未登记：{project_id}"
             )
 
-        if not isinstance(args, dict):
-            raise ValueError("工具参数格式错误。")
+        require_task_project_scope(project_id)
+
+        if name == "modify_file":
+            if set(args.keys()) != {"relative_path", "old_text", "new_text"}:
+                raise PermissionError(
+                    "modify_file 参数必须且只能是：relative_path、old_text、new_text"
+                )
 
         if name == "read_project":
             allowed = set()
@@ -1295,6 +1342,7 @@ def modify_file(project_id, relative_path, old_text, new_text):
     - 必须精确匹配 old_text，防止误改
     """
     require_permission("modify")
+    require_task_project_scope(project_id)
 
     try:
         get_registered_project(project_id)
@@ -1653,6 +1701,9 @@ def execute_tool_plan(plan):
             else:
                 raise PermissionError(f"中央拒绝执行未知工具：{name}")
 
+            # 审批后、每项真正执行前再次核验项目范围。
+            require_task_project_scope(project_id)
+
             if name == "read_project":
                 result = read_project(project_id)
             elif name == "read_file":
@@ -1783,22 +1834,24 @@ def execute_tool_plan(plan):
 # 人类审批入口
 # ============================================================
 
-def approval_flow():
+def approval_flow(answer=None):
     """
     当前版本仍采用人工批准。
     不允许 DeepSeek 自己决定批准。
     """
     global STATE, CURRENT_TOOL_PLAN
 
-    print()
-    print("🔐 中央审批")
-    print("输入：")
-    print("  准奏 read")
-    print("  准奏 modify")
-    print("  驳回")
-    print()
-
-    answer = input("👑 圣裁：> ").strip()
+    if answer is None:
+        print()
+        print("🔐 中央审批")
+        print("输入：")
+        print("  准奏 read")
+        print("  准奏 modify")
+        print("  驳回")
+        print()
+        answer = input("👑 圣裁：> ").strip()
+    else:
+        answer = answer.strip()
 
     if answer == "退出":
         clear_authorization()
@@ -2026,7 +2079,7 @@ def main():
                 print("🔐 当前没有待批准的中央调度单，不能直接执行授权。请先下达具体任务。")
                 continue
 
-            permission = approval_flow()
+            permission = approval_flow(answer=command)
 
             if permission == "退出":
                 break
