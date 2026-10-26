@@ -310,6 +310,22 @@ IGNORED_SEARCH_DIRS = {
     "venv",
 }
 
+# 修改兵符只接受不超过 1 MiB 的文本文件，避免误读超大文件。
+MAX_MODIFY_BYTES = 1024 * 1024
+
+
+def read_modify_target_bounded(path):
+    """有硬字节上限地读取 UTF-8 文本，避免整文件无界载入内存。"""
+    with path.open("rb") as source:
+        raw = source.read(MAX_MODIFY_BYTES + 1)
+
+    if len(raw) > MAX_MODIFY_BYTES:
+        raise ValueError(
+            f"修改已拒绝：目标文件超过 {MAX_MODIFY_BYTES} bytes 上限。"
+        )
+
+    return raw.decode("utf-8")
+
 
 def is_forbidden_read(path):
     """
@@ -1417,7 +1433,7 @@ def modify_file(project_id, relative_path, old_text, new_text):
     if old_text == "":
         raise PermissionError("禁止空 old_text 修改，防止误插入。")
 
-    content = target.read_text()
+    content = read_modify_target_bounded(target)
     # 记录读取时的内容指纹，用于发现并发修改。
     import hashlib
     original_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -1493,7 +1509,7 @@ def modify_file(project_id, relative_path, old_text, new_text):
         os.chmod(temp_path, original_mode)
 
         # 替换前复核内容；若文件已变化，拒绝覆盖。
-        current_content = target.read_text()
+        current_content = read_modify_target_bounded(target)
         current_hash = hashlib.sha256(
             current_content.encode("utf-8")
         ).hexdigest()
