@@ -313,6 +313,12 @@ IGNORED_SEARCH_DIRS = {
 # 修改兵符只接受不超过 1 MiB 的文本文件，避免误读超大文件。
 MAX_MODIFY_BYTES = 1024 * 1024
 
+# 限制只读扫描的总工作量，避免超大文件或海量目录拖垮进程。
+MAX_LINE_READ_FILE_BYTES = 10 * 1024 * 1024
+MAX_SEARCH_PATHS = 20000
+MAX_SEARCH_FILES = 5000
+MAX_SEARCH_BYTES = 10 * 1024 * 1024
+
 
 def read_modify_target_bounded(path):
     """有硬字节上限地读取 UTF-8 文本，避免整文件无界载入内存。"""
@@ -466,6 +472,12 @@ def read_file(project_id, relative_path, start_line=None, end_line=None, max_byt
     size = target.stat().st_size
     has_line_range = start_line is not None or end_line is not None
 
+    # 行范围读取仍需逐行扫描文件；对超大文件直接拒绝，避免单行或总扫描量无界。
+    if has_line_range and size > MAX_LINE_READ_FILE_BYTES:
+        raise ValueError(
+            f"文件超过行范围读取上限 {MAX_LINE_READ_FILE_BYTES} bytes，拒绝扫描。"
+        )
+
     # 无行范围时，先检查大小，再读取，避免先把超大文件整体载入内存。
     if not has_line_range and size > max_bytes:
         raise ValueError(
@@ -546,9 +558,20 @@ def search_project(project_id, keyword, max_results=50):
         raise ValueError("搜索关键词不能为空。")
 
     results = []
+    visited_paths = 0
+    scanned_files = 0
+    scanned_bytes = 0
+    scan_truncated = False
 
     for path in root.rglob("*"):
+        visited_paths += 1
+        if visited_paths > MAX_SEARCH_PATHS:
+            scan_truncated = True
+            break
         if len(results) >= max_results:
+            break
+        if scanned_files >= MAX_SEARCH_FILES:
+            scan_truncated = True
             break
 
         # 跳过符号链接，避免搜索时读取链接目标。
@@ -582,9 +605,12 @@ def search_project(project_id, keyword, max_results=50):
         except OSError:
             continue
 
-        # 二进制/超大文件不参与普通文本搜索
+        # 二进制/超大文件不参与普通文本搜索；并限制本轮累计读取量。
         if size > 300 * 1024:
             continue
+        if scanned_bytes + size > MAX_SEARCH_BYTES:
+            scan_truncated = True
+            break
 
         try:
             text = path.read_text(
@@ -593,6 +619,9 @@ def search_project(project_id, keyword, max_results=50):
             )
         except (OSError, UnicodeError):
             continue
+
+        scanned_files += 1
+        scanned_bytes += size
 
         if keyword.lower() not in text.lower():
             continue
@@ -615,7 +644,10 @@ def search_project(project_id, keyword, max_results=50):
         "status": "ok",
         "keyword": keyword,
         "results": results,
-        "count": len(results)
+        "count": len(results),
+        "scanned_files": scanned_files,
+        "scanned_bytes": scanned_bytes,
+        "scan_truncated": scan_truncated
     }
 
 
