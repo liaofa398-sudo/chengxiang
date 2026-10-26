@@ -1659,13 +1659,14 @@ def modify_file(project_id, relative_path, old_text, new_text):
     backup = target.with_name(
         target.name + ".before_chengxiang_modify.bak"
     )
+    backup_relative = backup.relative_to(root)
 
-    # lexists 能识别断开的符号链接，不能只依赖 exists。
+    # lexists 能识别断开的符号链接，不能只依赖 exists.
     import os
 
     if os.path.lexists(backup):
         raise FileExistsError(
-            f"安全停止：备份路径已存在或被占用，请先人工确认：{backup}"
+            f"安全停止：备份路径已存在或被占用，请先人工确认项目内路径：{backup_relative}"
         )
 
     # 独占创建备份，拒绝覆盖已存在的路径。
@@ -1680,7 +1681,7 @@ def modify_file(project_id, relative_path, old_text, new_text):
             os.fsync(backup_file.fileno())
     except FileExistsError:
         raise FileExistsError(
-            f"安全停止：备份路径已被占用，请先人工确认：{backup}"
+            f"安全停止：备份路径已被占用，请先人工确认项目内路径：{backup_relative}"
         )
     except BaseException as original_error:
         if backup_created:
@@ -1689,7 +1690,8 @@ def modify_file(project_id, relative_path, old_text, new_text):
             except OSError as cleanup_error:
                 raise RuntimeError(
                     "备份写入失败，且清理残留备份失败。"
-                    f"请人工检查：{backup}；清理错误：{cleanup_error}"
+                    f"请人工检查项目内路径：{backup_relative}；"
+                    f"清理错误类型：{type(cleanup_error).__name__}"
                 ) from original_error
         raise
 
@@ -1724,7 +1726,7 @@ def modify_file(project_id, relative_path, old_text, new_text):
         if current_hash != original_hash:
             raise RuntimeError(
                 "安全停止：目标文件在读取后发生变化，拒绝覆盖。"
-                f"原始备份保留：{backup}"
+                f"原始备份保留于项目内路径：{backup_relative}"
             )
 
         os.replace(temp_path, target)
