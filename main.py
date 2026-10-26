@@ -1428,6 +1428,9 @@ def parse_tool_plan(content):
                     raise ValueError("read_file 的 relative_path 必须是非空字符串。")
 
                 if project_root is not None:
+                    # 规划阶段也必须拒绝符号链接别名；不能先 resolve()
+                    # 再检查，否则项目内链接可能绕过原始路径策略。
+                    reject_symlink_components(project_root, relative_path)
                     target = (project_root / relative_path).resolve()
 
                     try:
