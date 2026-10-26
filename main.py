@@ -1642,6 +1642,8 @@ def modify_file(project_id, relative_path, old_text, new_text):
     try:
         with backup.open("x", encoding="utf-8") as backup_file:
             backup_created = True
+            # 备份权限不依赖进程 umask；仅允许文件所有者访问。
+            os.fchmod(backup_file.fileno(), 0o600)
             backup_file.write(content)
             backup_file.flush()
             os.fsync(backup_file.fileno())
