@@ -296,9 +296,11 @@ def safe_project_path(project):
     if not path:
         return None
 
-    # 先做词法规范化，再逐级拒绝符号链接；不能先 resolve()，
-    # 否则会丢失登记路径中存在符号链接这一事实。
-    expanded = Path(os.path.abspath(os.path.expanduser(str(path))))
+    # 保留 .. 组件以便先检查它之前的每一级路径；abspath() 会折叠
+    # ..，可能隐藏“符号链接/..”路径中经过的符号链接。
+    expanded = Path(os.path.expanduser(str(path)))
+    if not expanded.is_absolute():
+        expanded = Path.cwd() / expanded
 
     current = Path(expanded.anchor)
     for part in expanded.parts[1:]:
@@ -308,12 +310,13 @@ def safe_project_path(project):
                 "项目路径包含符号链接，拒绝访问。"
             )
 
-    # 安全边界：
-    # 当前只允许访问用户 Home 目录下的路径。
+    # 只有拒绝路径中的符号链接后才解析规范路径，并再次验证最终目标
+    # 仍位于 Home 内；这样也能拦截包含 .. 的 Home 外路径。
+    resolved = expanded.resolve()
     home = Path.home().resolve()
 
     try:
-        relative_home_path = expanded.relative_to(home)
+        relative_home_path = resolved.relative_to(home)
     except ValueError:
         raise PermissionError(
             "项目路径超出当前用户 Home 目录，拒绝读取。"
@@ -325,7 +328,7 @@ def safe_project_path(project):
             "项目路径位于敏感目录内，拒绝访问。"
         )
 
-    return expanded
+    return resolved
 
 
 
