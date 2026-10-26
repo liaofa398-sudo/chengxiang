@@ -569,6 +569,7 @@ def search_project(project_id, keyword, max_results=50):
             scan_truncated = True
             break
         if len(results) >= max_results:
+            scan_truncated = True
             break
         if scanned_files >= MAX_SEARCH_FILES:
             scan_truncated = True
