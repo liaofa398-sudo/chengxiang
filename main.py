@@ -1722,10 +1722,11 @@ def modify_file(project_id, relative_path, old_text, new_text):
             except OSError:
                 pass
 
+    # 返回项目内相对路径，避免把本机绝对路径传入计划结果或日志。
     return {
         "project": project_id,
-        "file": str(target),
-        "backup": str(backup),
+        "file": str(target.relative_to(root)),
+        "backup": str(backup.relative_to(root)),
         "replaced": 1,
     }
 
