@@ -762,12 +762,28 @@ def read_project(project_id):
         import subprocess
 
         try:
+            # 禁用仓库配置中的 fsmonitor 外部命令及全局/系统 Git 配置。
+            # status 是只读命令，但仍应避免信任项目内配置启动额外程序。
+            git_env = os.environ.copy()
+            git_env["GIT_CONFIG_NOSYSTEM"] = "1"
+            git_env["GIT_CONFIG_GLOBAL"] = os.devnull
+            git_env["GIT_TERMINAL_PROMPT"] = "0"
+            git_env["GIT_OPTIONAL_LOCKS"] = "0"
+
             completed = subprocess.run(
-                ["git", "-C", str(path), "status", "--short", "--branch"],
+                [
+                    "git",
+                    "-c", "core.fsmonitor=false",
+                    "-c", "core.hooksPath=/dev/null",
+                    "-C", str(path),
+                    "status", "--short", "--branch",
+                    "--untracked-files=no",
+                ],
                 capture_output=True,
                 text=True,
                 timeout=10,
-                check=False
+                check=False,
+                env=git_env,
             )
 
             result["git_status"] = {
