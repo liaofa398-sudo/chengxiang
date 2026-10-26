@@ -1196,6 +1196,9 @@ def parse_tool_plan(content):
     except json.JSONDecodeError as e:
         raise ValueError(f"工具计划 JSON 错误：{e}")
 
+    if not isinstance(data, dict):
+        raise ValueError("工具计划顶层必须是 JSON 对象。")
+
     tools = data.get("tools", [])
 
     if not isinstance(tools, list):
@@ -1430,6 +1433,19 @@ def modify_file(project_id, relative_path, old_text, new_text):
     if not target.exists() or not target.is_file():
         raise FileNotFoundError(f"目标文件不存在：{relative_path}")
 
+    if not isinstance(old_text, str) or not isinstance(new_text, str):
+        raise PermissionError("old_text 和 new_text 必须是字符串。")
+
+    # 限制模型提供的替换文本，避免超大参数造成内存/磁盘消耗。
+    if len(old_text) > MAX_MODIFY_BYTES or len(new_text) > MAX_MODIFY_BYTES:
+        raise PermissionError(
+            f"替换文本长度超过 {MAX_MODIFY_BYTES} 字符上限。"
+        )
+    if len(old_text.encode("utf-8")) > MAX_MODIFY_BYTES:
+        raise PermissionError("old_text 超过 1 MiB 字节上限。")
+    if len(new_text.encode("utf-8")) > MAX_MODIFY_BYTES:
+        raise PermissionError("new_text 超过 1 MiB 字节上限。")
+
     if old_text == "":
         raise PermissionError("禁止空 old_text 修改，防止误插入。")
 
@@ -1446,6 +1462,12 @@ def modify_file(project_id, relative_path, old_text, new_text):
     if count > 1:
         raise ValueError(
             f"找到 {count} 处匹配，无法确认唯一修改位置，未修改文件。"
+        )
+
+    new_content = content.replace(old_text, new_text, 1)
+    if len(new_content.encode("utf-8")) > MAX_MODIFY_BYTES:
+        raise PermissionError(
+            f"修改后文件超过 {MAX_MODIFY_BYTES} bytes 上限，未写入。"
         )
 
     backup = target.with_name(
@@ -1482,8 +1504,6 @@ def modify_file(project_id, relative_path, old_text, new_text):
                     f"请人工检查：{backup}；清理错误：{cleanup_error}"
                 ) from original_error
         raise
-
-    new_content = content.replace(old_text, new_text, 1)
 
     # 同目录临时文件：完整写入后再替换正式文件。
     import os
