@@ -455,6 +455,7 @@ def read_file(project_id, relative_path, start_line=None, end_line=None, max_byt
         if (
             name == ".git"
             or name in FORBIDDEN_READ_NAMES
+            or name in FORBIDDEN_READ_DIRS
             or any(
                 name.endswith(suffix)
                 for suffix in FORBIDDEN_READ_SUFFIXES
