@@ -274,10 +274,16 @@ def safe_project_path(project):
     home = Path.home().resolve()
 
     try:
-        expanded.relative_to(home)
+        relative_home_path = expanded.relative_to(home)
     except ValueError:
         raise PermissionError(
             "项目路径超出当前用户 Home 目录，拒绝读取。"
+        )
+
+    forbidden_dirs = globals().get("FORBIDDEN_READ_DIRS", set())
+    if any(part.lower() in forbidden_dirs for part in relative_home_path.parts):
+        raise PermissionError(
+            "项目路径位于敏感目录内，拒绝访问。"
         )
 
     return expanded
@@ -303,6 +309,17 @@ FORBIDDEN_READ_SUFFIXES = {
     ".p12",
     ".pfx",
     ".token",
+}
+
+# 即使文件名看似普通，也不进入常见的凭据/私钥目录。
+FORBIDDEN_READ_DIRS = {
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".azure",
+    ".kube",
+    ".docker",
+    ".npm",
 }
 
 IGNORED_SEARCH_DIRS = {
@@ -596,8 +613,12 @@ def search_project(project_id, keyword, max_results=50):
         except ValueError:
             continue
 
-        # 跳过整个目录树中的特殊目录
-        if any(part in IGNORED_SEARCH_DIRS for part in relative.parts):
+        # 跳过整个目录树中的特殊目录和常见凭据目录。
+        if any(
+            part.lower() in IGNORED_SEARCH_DIRS
+            or part.lower() in FORBIDDEN_READ_DIRS
+            for part in relative.parts
+        ):
             continue
 
         # 敏感文件硬拒绝
@@ -716,6 +737,8 @@ def read_project(project_id):
             if entry.is_symlink():
                 continue
             if entry.name.lower() in IGNORED_SEARCH_DIRS:
+                continue
+            if entry.name.lower() in FORBIDDEN_READ_DIRS:
                 continue
             if is_forbidden_read(entry):
                 continue
@@ -1320,6 +1343,7 @@ def parse_tool_plan(content):
                         if (
                             name_part == ".git"
                             or name_part in FORBIDDEN_READ_NAMES
+                            or name_part in FORBIDDEN_READ_DIRS
                             or any(
                                 name_part.endswith(suffix)
                                 for suffix in FORBIDDEN_READ_SUFFIXES
@@ -1453,7 +1477,7 @@ def modify_file(project_id, relative_path, old_text, new_text):
     for component in posix_path.parts:
         name = component.lower()
 
-        if name in forbidden_components:
+        if name in forbidden_components or name in FORBIDDEN_READ_DIRS:
             raise PermissionError(
                 f"中央禁止修改敏感路径：{relative_path}"
             )
@@ -1483,7 +1507,7 @@ def modify_file(project_id, relative_path, old_text, new_text):
     resolved_relative = target.relative_to(root)
     for component in resolved_relative.parts:
         name = component.lower()
-        if name in forbidden_components or any(
+        if name in forbidden_components or name in FORBIDDEN_READ_DIRS or any(
             name.endswith(suffix)
             for suffix in FORBIDDEN_READ_SUFFIXES
         ):
