@@ -150,31 +150,47 @@ def load_env():
     if not os.path.lexists(ENV_FILE):
         return {}
 
-    # 不跟随符号链接读取密钥，并拒绝组/其他用户可读写的配置文件。
-    if ENV_FILE.is_symlink():
-        raise PermissionError("DEEPSEEK_API_KEY 配置文件不能是符号链接。")
-
-    env_info = ENV_FILE.stat()
-    if not stat.S_ISREG(env_info.st_mode):
-        raise PermissionError("DEEPSEEK_API_KEY 配置路径必须是普通文件。")
-    if stat.S_IMODE(env_info.st_mode) & 0o077:
+    # 通过文件描述符打开，并在打开时拒绝符号链接，避免检查后路径被替换。
+    if not hasattr(os, "O_NOFOLLOW"):
         raise PermissionError(
-            "DEEPSEEK_API_KEY 配置文件权限过宽，请设置为仅所有者可访问（例如 chmod 600）。"
+            "当前平台不支持安全打开配置文件（O_NOFOLLOW），拒绝读取密钥。"
         )
 
-    result = {}
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
 
-    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
+    try:
+        fd = os.open(ENV_FILE, flags)
+    except OSError as exc:
+        if not os.path.lexists(ENV_FILE):
+            return {}
+        raise PermissionError(
+            "无法安全打开 DEEPSEEK_API_KEY 配置文件。"
+        ) from exc
 
-        if not line or line.startswith("#") or "=" not in line:
-            continue
+    try:
+        env_info = os.fstat(fd)
+        if not stat.S_ISREG(env_info.st_mode):
+            raise PermissionError("DEEPSEEK_API_KEY 配置路径必须是普通文件。")
+        if stat.S_IMODE(env_info.st_mode) & 0o077:
+            raise PermissionError(
+                "DEEPSEEK_API_KEY 配置文件权限过宽，请设置为仅所有者可访问（例如 chmod 600）。"
+            )
 
-        key, value = line.split("=", 1)
-        result[key.strip()] = value.strip()
-
-    return result
-
+        with os.fdopen(fd, "r", encoding="utf-8") as env_file:
+            fd = None
+            result = {}
+            for line in env_file:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                result[key.strip()] = value.strip()
+            return result
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 def load_projects():
     if not PROJECTS_FILE.exists():
