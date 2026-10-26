@@ -120,6 +120,9 @@ def audit_event(event, **fields):
     flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    # 避免审计路径被替换为 FIFO 时，打开操作无限等待。
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
 
     fd = os.open(path, flags, 0o600)
     try:
