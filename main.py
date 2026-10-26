@@ -296,7 +296,17 @@ def safe_project_path(project):
     if not path:
         return None
 
-    expanded = Path(path).expanduser().resolve()
+    # 先做词法规范化，再逐级拒绝符号链接；不能先 resolve()，
+    # 否则会丢失登记路径中存在符号链接这一事实。
+    expanded = Path(os.path.abspath(os.path.expanduser(str(path))))
+
+    current = Path(expanded.anchor)
+    for part in expanded.parts[1:]:
+        current = current / part
+        if current.is_symlink():
+            raise PermissionError(
+                "项目路径包含符号链接，拒绝访问。"
+            )
 
     # 安全边界：
     # 当前只允许访问用户 Home 目录下的路径。
