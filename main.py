@@ -114,12 +114,13 @@ def audit_event(event, **fields):
     ).encode("utf-8")
 
     path = AUDIT_FILE
-    if os.path.lexists(path) and path.is_symlink():
-        raise OSError("拒绝写入符号链接审计日志。")
+    # 不支持 O_NOFOLLOW 的平台无法可靠防止检查后路径被替换为符号链接。
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise OSError(
+            "当前平台不支持安全打开审计日志（O_NOFOLLOW），拒绝写入。"
+        )
 
-    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW
     # 避免审计路径被替换为 FIFO 时，打开操作无限等待。
     if hasattr(os, "O_NONBLOCK"):
         flags |= os.O_NONBLOCK
