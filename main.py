@@ -147,8 +147,20 @@ def audit_event(event, **fields):
 # ============================================================
 
 def load_env():
-    if not ENV_FILE.exists():
+    if not os.path.lexists(ENV_FILE):
         return {}
+
+    # 不跟随符号链接读取密钥，并拒绝组/其他用户可读写的配置文件。
+    if ENV_FILE.is_symlink():
+        raise PermissionError("DEEPSEEK_API_KEY 配置文件不能是符号链接。")
+
+    env_info = ENV_FILE.stat()
+    if not stat.S_ISREG(env_info.st_mode):
+        raise PermissionError("DEEPSEEK_API_KEY 配置路径必须是普通文件。")
+    if stat.S_IMODE(env_info.st_mode) & 0o077:
+        raise PermissionError(
+            "DEEPSEEK_API_KEY 配置文件权限过宽，请设置为仅所有者可访问（例如 chmod 600）。"
+        )
 
     result = {}
 
