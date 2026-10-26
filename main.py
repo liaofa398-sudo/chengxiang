@@ -699,14 +699,15 @@ def read_project(project_id):
 
     # 只列出非敏感的一级条目，不暴露绝对路径或敏感文件名。
     try:
-        entries = sorted(
-            path.iterdir(),
-            key=lambda p: (not p.is_dir(), p.name.lower())
-        )
-
         visible_count = 0
-        for entry in entries:
-            if visible_count >= 200:
+        inspected_count = 0
+        listing_truncated = False
+
+        # 不先对整个目录排序/物化；目录条目过多时限制扫描量。
+        for entry in path.iterdir():
+            inspected_count += 1
+            if visible_count >= 200 or inspected_count > 2000:
+                listing_truncated = True
                 break
             if entry.is_symlink():
                 continue
@@ -720,6 +721,8 @@ def read_project(project_id):
                 "type": "directory" if entry.is_dir() else "file"
             })
             visible_count += 1
+
+        result["listing_truncated"] = listing_truncated
 
     except OSError as e:
         result["directory_error"] = type(e).__name__
