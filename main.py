@@ -826,6 +826,9 @@ def read_project(project_id):
     - 列出一级目录/文件
     - Git 状态
     - 不修改任何内容
+
+    目录访问使用稳定的已打开目录 fd，避免 safe_project_path()
+    检查完成后再通过路径重新解析而产生目录级 TOCTOU。
     """
     require_permission("read")
     require_task_project_scope(project_id)
@@ -836,7 +839,6 @@ def read_project(project_id):
         raise ValueError(f"户籍中不存在项目：{project_id}")
 
     project = projects[project_id]
-
     path = safe_project_path(project)
 
     if path is None:
@@ -849,96 +851,134 @@ def read_project(project_id):
             )
         }
 
-    if not path.exists():
-        return {
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise PermissionError(
+            "当前平台不支持安全打开项目目录（O_NOFOLLOW），拒绝读取。"
+        )
+
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+
+    try:
+        root_fd = os.open(path, flags)
+    except OSError as exc:
+        raise PermissionError("无法安全打开项目目录。") from exc
+
+    try:
+        root_info = os.fstat(root_fd)
+        if not stat.S_ISDIR(root_info.st_mode):
+            raise PermissionError("登记的项目路径不是目录。")
+
+        result = {
             "project": project_id,
-            "status": "path_missing",
-            "message": "登记路径不存在。"
+            "status": "ok",
+            "entries": [],
+            "git_status": None
         }
 
-    result = {
-        "project": project_id,
-        "status": "ok",
-        "entries": [],
-        "git_status": None
-    }
-
-    # 只列出非敏感的一级条目，不暴露绝对路径或敏感文件名。
-    try:
-        visible_count = 0
-        inspected_count = 0
-        listing_truncated = False
-
-        # 不先对整个目录排序/物化；目录条目过多时限制扫描量。
-        for entry in path.iterdir():
-            inspected_count += 1
-            if visible_count >= 200 or inspected_count > 2000:
-                listing_truncated = True
-                break
-            if entry.is_symlink():
-                continue
-            if entry.name.lower() in IGNORED_SEARCH_DIRS:
-                continue
-            if entry.name.lower() in FORBIDDEN_READ_DIRS:
-                continue
-            if is_forbidden_read(entry):
-                continue
-
-            result["entries"].append({
-                "name": entry.name,
-                "type": "directory" if entry.is_dir() else "file"
-            })
-            visible_count += 1
-
-        result["listing_truncated"] = listing_truncated
-
-    except OSError as e:
-        result["directory_error"] = type(e).__name__
-
-    # Git 状态：只读 subprocess
-    git_dir = path / ".git"
-
-    if git_dir.exists():
-        import subprocess
-
+        # 使用已打开目录 fd 列出一级条目；即使路径随后被替换，
+        # 这个 fd 仍然指向最初打开的目录。
         try:
-            # 禁用仓库配置中的 fsmonitor 外部命令及全局/系统 Git 配置。
-            # status 是只读命令，但仍应避免信任项目内配置启动额外程序。
-            git_env = os.environ.copy()
-            git_env["GIT_CONFIG_NOSYSTEM"] = "1"
-            git_env["GIT_CONFIG_GLOBAL"] = os.devnull
-            git_env["GIT_TERMINAL_PROMPT"] = "0"
-            git_env["GIT_OPTIONAL_LOCKS"] = "0"
+            visible_count = 0
+            inspected_count = 0
+            listing_truncated = False
 
-            completed = subprocess.run(
-                [
-                    "git",
-                    "-c", "core.fsmonitor=false",
-                    "-c", "core.hooksPath=/dev/null",
-                    "-C", str(path),
-                    "status", "--short", "--branch",
-                    "--untracked-files=no",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-                env=git_env,
-            )
+            for name in os.listdir(root_fd):
+                inspected_count += 1
+                if visible_count >= 200 or inspected_count > 2000:
+                    listing_truncated = True
+                    break
 
-            result["git_status"] = {
-                "returncode": completed.returncode,
-                "output": completed.stdout[:10000],
-                # 不回显 Git stderr 原文，避免异常信息带出本机绝对路径。
-                "stderr_present": bool(completed.stderr.strip())
-            }
+                lowered = name.lower()
+                if lowered in IGNORED_SEARCH_DIRS:
+                    continue
+                if lowered in FORBIDDEN_READ_DIRS:
+                    continue
+                if lowered in FORBIDDEN_READ_NAMES:
+                    continue
+                if any(lowered.endswith(suffix) for suffix in FORBIDDEN_READ_SUFFIXES):
+                    continue
 
-        except Exception as e:
-            result["git_status"] = {
-                "error_type": type(e).__name__
-            }
+                try:
+                    info = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+                except OSError:
+                    continue
 
-    return result
+                # 符号链接及其他非普通文件/目录不暴露。
+                if stat.S_ISLNK(info.st_mode):
+                    continue
+                if stat.S_ISDIR(info.st_mode):
+                    entry_type = "directory"
+                elif stat.S_ISREG(info.st_mode):
+                    entry_type = "file"
+                else:
+                    continue
+
+                result["entries"].append({
+                    "name": name,
+                    "type": entry_type
+                })
+                visible_count += 1
+
+            result["listing_truncated"] = listing_truncated
+
+        except OSError as e:
+            result["directory_error"] = type(e).__name__
+
+        # Git 状态必须绑定到同一个已打开目录。
+        # /proc/self/fd/<fd> 是稳定的 fd 引用；若当前平台不可用，
+        # 宁可不执行 Git 状态，也不退回到不安全的路径访问。
+        git_dir_exists = False
+        try:
+            git_info = os.stat(".git", dir_fd=root_fd, follow_symlinks=False)
+            git_dir_exists = stat.S_ISDIR(git_info.st_mode)
+        except OSError:
+            git_dir_exists = False
+
+        if git_dir_exists:
+            import subprocess
+
+            fd_path = Path(f"/proc/self/fd/{root_fd}")
+            if fd_path.exists():
+                try:
+                    git_env = os.environ.copy()
+                    git_env["GIT_CONFIG_NOSYSTEM"] = "1"
+                    git_env["GIT_CONFIG_GLOBAL"] = os.devnull
+                    git_env["GIT_TERMINAL_PROMPT"] = "0"
+                    git_env["GIT_OPTIONAL_LOCKS"] = "0"
+
+                    completed = subprocess.run(
+                        [
+                            "git",
+                            "-c", "core.fsmonitor=false",
+                            "-c", "core.hooksPath=/dev/null",
+                            "-C", str(fd_path),
+                            "status", "--short", "--branch",
+                            "--untracked-files=no",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                        env=git_env,
+                    )
+
+                    result["git_status"] = {
+                        "returncode": completed.returncode,
+                        "output": completed.stdout[:10000],
+                        "stderr_present": bool(completed.stderr.strip())
+                    }
+
+                except Exception as e:
+                    result["git_status"] = {
+                        "error_type": type(e).__name__
+                    }
+
+        return result
+
+    finally:
+        os.close(root_fd)
 
 
 # ============================================================
