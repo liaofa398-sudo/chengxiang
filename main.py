@@ -584,43 +584,29 @@ def read_file(project_id, relative_path, start_line=None, end_line=None, max_byt
 
     root = get_local_project_root(project_id)
 
-    # 先检查原始路径的每一级，拒绝符号链接别名，再解析最终路径。
     reject_symlink_components(root, relative_path)
     target = (root / relative_path).resolve()
 
     try:
         resolved_relative = target.relative_to(root)
     except ValueError:
-        raise PermissionError(
-            "拒绝读取项目目录之外的文件。"
-        )
+        raise PermissionError("拒绝读取项目目录之外的文件。")
 
-    # 检查解析后的完整路径，防止通过子目录或符号链接
-    # 访问 .git、密钥文件及其他中央禁止读取的目标。
     for component in resolved_relative.parts:
         name = component.lower()
         if (
             name == ".git"
             or name in FORBIDDEN_READ_NAMES
             or name in FORBIDDEN_READ_DIRS
-            or any(
-                name.endswith(suffix)
-                for suffix in FORBIDDEN_READ_SUFFIXES
-            )
+            or any(name.endswith(suffix) for suffix in FORBIDDEN_READ_SUFFIXES)
         ):
-            raise PermissionError(
-                f"拒绝读取敏感路径：{relative_path}"
-            )
+            raise PermissionError(f"拒绝读取敏感路径：{relative_path}")
 
     if not target.exists():
-        raise FileNotFoundError(
-            f"文件不存在：{relative_path}"
-        )
+        raise FileNotFoundError(f"文件不存在：{relative_path}")
 
     if not target.is_file():
-        raise ValueError(
-            f"目标不是普通文件：{relative_path}"
-        )
+        raise ValueError(f"目标不是普通文件：{relative_path}")
 
     if start_line is not None or end_line is not None:
         if start_line is None:
@@ -630,51 +616,49 @@ def read_file(project_id, relative_path, start_line=None, end_line=None, max_byt
 
         if not isinstance(start_line, int) or not isinstance(end_line, int):
             raise ValueError("start_line 和 end_line 必须是整数。")
-
         if start_line < 1 or end_line < start_line:
             raise ValueError("行范围无效。")
-
         if end_line - start_line + 1 > 500:
             raise ValueError("单次最多读取 500 行。")
 
     has_line_range = start_line is not None or end_line is not None
 
-    # 行范围读取仍需逐行扫描文件；对超大文件直接拒绝，避免单行或总扫描量无界。
-    if has_line_range and size > MAX_LINE_READ_FILE_BYTES:
-        raise ValueError(
-            f"文件超过行范围读取上限 {MAX_LINE_READ_FILE_BYTES} bytes，拒绝扫描。"
-        )
-
-    # 无行范围时，先检查大小，再读取，避免先把超大文件整体载入内存。
-    if not has_line_range and size > max_bytes:
-        raise ValueError(
-            f"文件过大：{relative_path} ({size} bytes)，"
-            f"单次最多读取 {max_bytes} bytes。"
-        )
-
     try:
+        fd, size = open_regular_read(target)
+
+        if has_line_range and size > MAX_LINE_READ_FILE_BYTES:
+            os.close(fd)
+            raise ValueError(
+                f"文件超过行范围读取上限 {MAX_LINE_READ_FILE_BYTES} bytes，拒绝扫描。"
+            )
+
+        if not has_line_range and size > max_bytes:
+            os.close(fd)
+            raise ValueError(
+                f"文件过大：{relative_path} ({size} bytes)，"
+                f"单次最多读取 {max_bytes} bytes。"
+            )
+
         if has_line_range:
             selected = []
             selected_bytes = 0
             total_lines = 0
 
-            # 逐行读取，只保留请求范围；不把整个文件读入内存。
-            fd, size = open_regular_read(target)
             try:
                 with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as source:
                     fd = None
                     for line_number, line in enumerate(source, 1):
-                    total_lines = line_number
-                    if start_line <= line_number <= end_line:
-                        line = line.rstrip("\r\n")
-                        line_bytes = len(line.encode("utf-8"))
-                        added_bytes = line_bytes + (1 if selected else 0)
-                        if selected_bytes + added_bytes > max_bytes:
-                            raise ValueError(
-                                f"指定行范围过大，单次最多返回 {max_bytes} bytes。"
-                            )
-                        selected.append(line)
-                        selected_bytes += added_bytes
+                        total_lines = line_number
+                        if start_line <= line_number <= end_line:
+                            line = line.rstrip("\r\n")
+                            line_bytes = len(line.encode("utf-8"))
+                            added_bytes = line_bytes + (1 if selected else 0)
+                            if selected_bytes + added_bytes > max_bytes:
+                                raise ValueError(
+                                    f"指定行范围过大，单次最多返回 {max_bytes} bytes。"
+                                )
+                            selected.append(line)
+                            selected_bytes += added_bytes
             finally:
                 if fd is not None:
                     os.close(fd)
@@ -698,7 +682,6 @@ def read_file(project_id, relative_path, start_line=None, end_line=None, max_byt
                 "content": result_content
             }
 
-        fd, size = open_regular_read(target)
         try:
             with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as source:
                 fd = None
@@ -706,19 +689,17 @@ def read_file(project_id, relative_path, start_line=None, end_line=None, max_byt
         finally:
             if fd is not None:
                 os.close(fd)
-    except OSError as e:
-        raise RuntimeError(
-            f"读取文件失败：{type(e).__name__}"
-        ) from e
 
-    return {
-        "project": project_id,
-        "status": "ok",
-        "file": relative_path,
-        "bytes": size,
-        "content": content
-    }
+        return {
+            "project": project_id,
+            "status": "ok",
+            "file": relative_path,
+            "bytes": size,
+            "content": content
+        }
 
+    except (OSError, UnicodeError) as e:
+        raise RuntimeError(f"读取文件失败：{type(e).__name__}") from e
 
 
 def search_project(project_id, keyword, max_results=50):
