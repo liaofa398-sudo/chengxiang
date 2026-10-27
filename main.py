@@ -194,11 +194,49 @@ def load_env():
             os.close(fd)
 
 def load_projects():
-    if not PROJECTS_FILE.exists():
+    if not os.path.lexists(PROJECTS_FILE):
         return {}
 
-    with open(PROJECTS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f).get("projects", {})
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise PermissionError(
+            "当前平台不支持安全打开项目户籍（O_NOFOLLOW），拒绝读取。"
+        )
+
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+
+    try:
+        fd = os.open(PROJECTS_FILE, flags)
+    except OSError as exc:
+        if not os.path.lexists(PROJECTS_FILE):
+            return {}
+        raise PermissionError(
+            "无法安全打开项目户籍文件。"
+        ) from exc
+
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise PermissionError("项目户籍路径必须是普通文件。")
+
+        with os.fdopen(fd, "r", encoding="utf-8") as project_file:
+            fd = None
+            data = json.load(project_file)
+    except json.JSONDecodeError as exc:
+        raise ValueError("项目户籍 JSON 格式无效。") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+    if not isinstance(data, dict):
+        raise ValueError("项目户籍顶层必须是 JSON 对象。")
+
+    projects = data.get("projects", {})
+    if not isinstance(projects, dict):
+        raise ValueError("项目户籍 projects 必须是对象。")
+
+    return projects
 
 
 # ============================================================
@@ -395,6 +433,34 @@ def read_modify_target_bounded(path):
     return raw.decode("utf-8")
 
 
+def open_regular_read(path):
+    """以不可跟随符号链接的方式打开并校验普通文件。"""
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise PermissionError(
+            "当前平台不支持安全打开项目文件（O_NOFOLLOW），拒绝读取。"
+        )
+
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise PermissionError(
+            "无法安全打开项目文件。"
+        ) from exc
+
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise PermissionError("项目文件必须是普通文件。")
+        return fd, info.st_size
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def is_forbidden_read(path):
     """
     中央只读安全门。
@@ -571,7 +637,6 @@ def read_file(project_id, relative_path, start_line=None, end_line=None, max_byt
         if end_line - start_line + 1 > 500:
             raise ValueError("单次最多读取 500 行。")
 
-    size = target.stat().st_size
     has_line_range = start_line is not None or end_line is not None
 
     # 行范围读取仍需逐行扫描文件；对超大文件直接拒绝，避免单行或总扫描量无界。
@@ -594,8 +659,11 @@ def read_file(project_id, relative_path, start_line=None, end_line=None, max_byt
             total_lines = 0
 
             # 逐行读取，只保留请求范围；不把整个文件读入内存。
-            with target.open("r", encoding="utf-8", errors="replace") as source:
-                for line_number, line in enumerate(source, 1):
+            fd, size = open_regular_read(target)
+            try:
+                with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as source:
+                    fd = None
+                    for line_number, line in enumerate(source, 1):
                     total_lines = line_number
                     if start_line <= line_number <= end_line:
                         line = line.rstrip("\r\n")
@@ -607,6 +675,9 @@ def read_file(project_id, relative_path, start_line=None, end_line=None, max_byt
                             )
                         selected.append(line)
                         selected_bytes += added_bytes
+            finally:
+                if fd is not None:
+                    os.close(fd)
 
             if start_line > total_lines:
                 raise ValueError(
@@ -627,10 +698,14 @@ def read_file(project_id, relative_path, start_line=None, end_line=None, max_byt
                 "content": result_content
             }
 
-        content = target.read_text(
-            encoding="utf-8",
-            errors="replace"
-        )
+        fd, size = open_regular_read(target)
+        try:
+            with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as source:
+                fd = None
+                content = source.read()
+        finally:
+            if fd is not None:
+                os.close(fd)
     except OSError as e:
         raise RuntimeError(
             f"读取文件失败：{type(e).__name__}"
@@ -708,8 +783,8 @@ def search_project(project_id, keyword, max_results=50):
             continue
 
         try:
-            size = path.stat().st_size
-        except OSError:
+            fd, size = open_regular_read(path)
+        except PermissionError:
             continue
 
         # 二进制/超大文件不参与普通文本搜索；并限制本轮累计读取量。
@@ -720,10 +795,13 @@ def search_project(project_id, keyword, max_results=50):
             break
 
         try:
-            text = path.read_text(
-                encoding="utf-8",
-                errors="replace"
-            )
+            try:
+                with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as source:
+                    fd = None
+                    text = source.read()
+            finally:
+                if fd is not None:
+                    os.close(fd)
         except (OSError, UnicodeError):
             continue
 
