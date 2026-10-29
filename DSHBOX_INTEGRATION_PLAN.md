@@ -103,3 +103,20 @@
 - [ ] 单元测试已实际运行。
 - [ ] GitHub PR 已创建并审查。
 - [ ] 主分支合并或部署（需要另行授权，不属于当前阶段）。
+
+
+## DSHBox 官方资料补充（2026-10-29）
+
+根据 DSHBox 官方项目页面（https://wsk-build.github.io/DSHBox/），当前公开说明列出 DSHBox v1.5.0（2026-10-17）、Debian 用户态通过 PRoot 运行、DSH 0.2.0-rc.2，以及内嵌 WebView 与本地 Web 服务。该信息是项目公开资料，不等于已核实用户设备上的实际安装版本。
+
+结合当前环境报告，下一步不应直接在 PRoot 内安装系统级沙箱依赖或修改内核设置。应先确认 DSHBox 的命令执行包装器究竟运行在 Android 宿主、PRoot guest 还是其他层；PRoot 中能看到某个文件不代表具备宿主内核隔离能力。
+
+DSH 项目的公开沙箱资料说明，本地 Linux runner 会探测 bubblewrap 与 Landlock，并在没有可用 runner 时失败关闭，不会静默退回不受限执行（参考：https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/sandbox.md）。因此当前错误应按“隔离后端不可用”处理，而不是通过关闭沙箱来修复。
+
+### 下一轮环境盘点清单（只读）
+
+- 在 DSHBox UI 中记录实际 DSHBox 应用版本、DSH 层版本与运行时信息；不要输出环境变量或秘密。
+- 确认报错来自哪个执行入口（bash 工具、终端会话、Pilot 或其他插件），不同入口不可视为同一执行器。
+- 查看该版本官方配置中是否支持远程/容器执行后端或工作区隔离；仅采用有文档支持的方式。
+- 确认文件工具访问 GitHub 的能力是否独立于 shell 执行能力。
+- 在没有明确隔离证明前，禁止运行写入命令、安装包、修改安全配置或测试真实项目文件。
