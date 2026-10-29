@@ -467,13 +467,17 @@ def is_forbidden_read(path):
     即使 DeepSeek 要求读取，也不能读取明显的密钥文件。
     """
     name = path.name.lower()
-
-    if name in FORBIDDEN_READ_NAMES:
+    if (
+        name in FORBIDDEN_READ_NAMES
+        or name == ".envrc"
+        or name == ".netrc"
+        or name == ".npmrc"
+        or name.startswith(".env.")
+        or name in {".pypirc", "id_rsa", "id_ed25519", "known_hosts"}
+    ):
         return True
-
     if any(name.endswith(suffix) for suffix in FORBIDDEN_READ_SUFFIXES):
         return True
-
     return False
 
 
@@ -614,8 +618,11 @@ def read_file(project_id, relative_path, start_line=None, end_line=None, max_byt
         if end_line is None:
             end_line = start_line + 200
 
-        if not isinstance(start_line, int) or not isinstance(end_line, int):
-            raise ValueError("start_line 和 end_line 必须是整数。")
+        if (
+            not isinstance(start_line, int) or isinstance(start_line, bool)
+            or not isinstance(end_line, int) or isinstance(end_line, bool)
+        ):
+            raise ValueError("start_line 和 end_line 必须是整数，不能是布尔值。")
         if start_line < 1 or end_line < start_line:
             raise ValueError("行范围无效。")
         if end_line - start_line + 1 > 500:
@@ -768,23 +775,21 @@ def search_project(project_id, keyword, max_results=50):
         except PermissionError:
             continue
 
-        # 二进制/超大文件不参与普通文本搜索；并限制本轮累计读取量。
-        if size > 300 * 1024:
-            continue
-        if scanned_bytes + size > MAX_SEARCH_BYTES:
-            scan_truncated = True
-            break
-
+        # 文件描述符必须在所有路径释放，包括大小/累计额度提前退出。
         try:
-            try:
-                with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as source:
-                    fd = None
-                    text = source.read()
-            finally:
-                if fd is not None:
-                    os.close(fd)
+            if size > 300 * 1024:
+                continue
+            if scanned_bytes + size > MAX_SEARCH_BYTES:
+                scan_truncated = True
+                break
+            with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as source:
+                fd = None
+                text = source.read()
         except (OSError, UnicodeError):
             continue
+        finally:
+            if fd is not None:
+                os.close(fd)
 
         scanned_files += 1
         scanned_bytes += size
@@ -1459,6 +1464,8 @@ def parse_tool_plan(content):
     if not isinstance(data, dict):
         raise ValueError("工具计划顶层必须是 JSON 对象。")
 
+    if set(data) != {"tools"}:
+        raise ValueError("工具计划顶层必须且只能包含 tools 字段。")
     tools = data.get("tools", [])
 
     if not isinstance(tools, list):
@@ -1566,14 +1573,14 @@ def parse_tool_plan(content):
                             )
 
             if "start_line" in args:
-                if not isinstance(args["start_line"], int):
-                    raise ValueError("start_line 必须是整数")
+                if not isinstance(args["start_line"], int) or isinstance(args["start_line"], bool):
+                    raise ValueError("start_line 必须是整数，不能是布尔值")
                 if args["start_line"] < 1:
                     raise ValueError("start_line 必须 >= 1")
 
             if "end_line" in args:
-                if not isinstance(args["end_line"], int):
-                    raise ValueError("end_line 必须是整数")
+                if not isinstance(args["end_line"], int) or isinstance(args["end_line"], bool):
+                    raise ValueError("end_line 必须是整数，不能是布尔值")
                 if args["end_line"] < 1:
                     raise ValueError("end_line 必须 >= 1")
 
@@ -1968,7 +1975,7 @@ def execute_tool_plan(plan):
                 f"拒绝执行：批准权限不足，工具 {name!r} 需要 {required}。"
             )
 
-    source_name = approval.get("source", "human")
+    source_name = approval.get("source")
     audit_event(
         "execution_started",
         permission=approved_permission,
@@ -2529,7 +2536,11 @@ TOOL_PLAN_JSON: {{"tools":[]}}
                 continue
 
             else:
-                print("⚠️ 当前版本尚未接入该权限执行器。")
+                print("⚠️ 当前版本尚未接入该权限执行器；本次授权立即收回。")
+                clear_authorization()
+                CURRENT_TOOL_PLAN = []
+                STATE = "IDLE"
+                reset_current_task()
                 continue
 
         if not command:
