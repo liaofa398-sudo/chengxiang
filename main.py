@@ -602,6 +602,9 @@ def read_file(project_id, relative_path, start_line=None, end_line=None, max_byt
             name == ".git"
             or name in FORBIDDEN_READ_NAMES
             or name in FORBIDDEN_READ_DIRS
+            or name in {".envrc", ".netrc", ".npmrc", ".pypirc",
+                        "id_rsa", "id_ed25519", "known_hosts"}
+            or name.startswith(".env.")
             or any(name.endswith(suffix) for suffix in FORBIDDEN_READ_SUFFIXES)
         ):
             raise PermissionError(f"拒绝读取敏感路径：{relative_path}")
@@ -1484,6 +1487,8 @@ def parse_tool_plan(content):
     for item in tools:
         if not isinstance(item, dict):
             raise ValueError("工具计划存在无效项目。")
+        if set(item) != {"name", "project_id", "args"}:
+            raise ValueError("每个工具计划条目必须且只能包含 name、project_id、args。")
 
         name = item.get("name")
         project_id = item.get("project_id")
@@ -1556,6 +1561,9 @@ def parse_tool_plan(content):
                             name_part == ".git"
                             or name_part in FORBIDDEN_READ_NAMES
                             or name_part in FORBIDDEN_READ_DIRS
+                            or name_part in {".envrc", ".netrc", ".npmrc", ".pypirc",
+                                             "id_rsa", "id_ed25519", "known_hosts"}
+                            or name_part.startswith(".env.")
                             or any(
                                 name_part.endswith(suffix)
                                 for suffix in FORBIDDEN_READ_SUFFIXES
