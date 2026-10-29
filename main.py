@@ -900,9 +900,13 @@ def read_project(project_id):
                     continue
                 if lowered in FORBIDDEN_READ_DIRS:
                     continue
-                if lowered in FORBIDDEN_READ_NAMES:
-                    continue
-                if any(lowered.endswith(suffix) for suffix in FORBIDDEN_READ_SUFFIXES):
+                if (
+                    lowered in FORBIDDEN_READ_NAMES
+                    or lowered in {".envrc", ".netrc", ".npmrc", ".pypirc",
+                                   "id_rsa", "id_ed25519", "known_hosts"}
+                    or lowered.startswith(".env.")
+                    or any(lowered.endswith(suffix) for suffix in FORBIDDEN_READ_SUFFIXES)
+                ):
                     continue
 
                 try:
@@ -1680,12 +1684,19 @@ def modify_file(project_id, relative_path, old_text, new_text):
     if ".." in posix_path.parts or ".." in windows_path.parts:
         raise PermissionError("禁止使用 .. 越界访问项目目录。")
 
-    forbidden_components = set(FORBIDDEN_READ_NAMES) | {".git"}
+    forbidden_components = set(FORBIDDEN_READ_NAMES) | {
+        ".git", ".envrc", ".netrc", ".npmrc", ".pypirc",
+        "id_rsa", "id_ed25519", "known_hosts",
+    }
 
     for component in posix_path.parts:
         name = component.lower()
 
-        if name in forbidden_components or name in FORBIDDEN_READ_DIRS:
+        if (
+            name in forbidden_components
+            or name in FORBIDDEN_READ_DIRS
+            or name.startswith(".env.")
+        ):
             raise PermissionError(
                 f"中央禁止修改敏感路径：{relative_path}"
             )
@@ -1957,8 +1968,8 @@ def execute_tool_plan(plan):
     for item in plan:
         if not isinstance(item, dict):
             raise PermissionError("拒绝执行：计划条目格式无效。")
-        if not {"name", "project_id", "args"}.issubset(item):
-            raise PermissionError("拒绝执行：计划条目缺少必要字段。")
+        if set(item) != {"name", "project_id", "args"}:
+            raise PermissionError("拒绝执行：计划条目必须且只能包含 name、project_id、args。")
 
         name = item["name"]
         if name in ALLOWED_READ_TOOLS:
@@ -1976,6 +1987,9 @@ def execute_tool_plan(plan):
             )
 
     source_name = approval.get("source")
+    if source_name != "human":
+        raise PermissionError("拒绝执行：批准来源不是经过验证的人工审批。")
+
     audit_event(
         "execution_started",
         permission=approved_permission,
