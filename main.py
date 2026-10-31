@@ -1,6 +1,12 @@
+import ctypes
+import datetime
+import errno
+import fcntl
+import hashlib
 import json
 import os
 import stat
+import tempfile
 import urllib.request
 import urllib.error
 import subprocess
@@ -133,7 +139,14 @@ def audit_event(event, **fields):
         if written != len(payload):
             raise OSError("审计记录未完整写入。")
         os.fsync(fd)
-    finally:
+    except BaseException:
+        # 有异常在飞：关闭失败不得覆盖它，原始异常原样上抛。
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    else:
         os.close(fd)
 
 
@@ -180,7 +193,12 @@ def permission_level(permission):
         "git": 3,
         "dangerous": 4
     }
-    return order.get(permission, 999)
+
+    # 未知权限必须显式拒绝：绝不能默认成最高等级或任何有效等级。
+    if permission not in order:
+        raise ValueError(f"拒绝未知权限：{permission!r}。")
+
+    return order[permission]
 
 
 def authorize(permission):
@@ -198,6 +216,12 @@ def authorize(permission):
 
 
 def clear_authorization():
+    """收回授权变量。
+
+    只负责清理 AUTHORIZED_PERMISSION 与 PLAN_APPROVAL；
+    STATE 由调用方显式设置（例如 "IDLE" 或 "EXIT"），
+    本函数不写入 STATE，以免覆盖 "EXIT" 等合法终态。
+    """
     global AUTHORIZED_PERMISSION, PLAN_APPROVAL
 
     had_authorization = (
@@ -252,12 +276,47 @@ def require_permission(required):
 # 第一枚兵符：只读工具
 # ============================================================
 
+def _path_is_within(child, parent):
+    """child 是否等于 parent 或位于其下；两者均须为已 resolve 的 Path。"""
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _stat_identity(path):
+    """返回 path 的 (st_dev, st_ino)。
+
+    - 路径不存在（含 ENOTDIR）：返回 None —— 这是确定的"不是同一对象"。
+    - 其它任何 OSError（EACCES / EIO / ELOOP ...）：抛 PermissionError。
+      无法确认安全时必须拒绝，不得降级为放行。
+    """
+    try:
+        info = os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        raise PermissionError(
+            f"无法确认路径的文件系统身份，拒绝继续：{path}"
+            f"（{type(exc).__name__}）"
+        ) from exc
+
+    return (info.st_dev, info.st_ino)
+
+
 def safe_project_path(project):
     """
     根据户籍解析项目路径。
 
     当前只允许明确登记过的本地 path。
     repository / Codespace 暂时不执行实际访问。
+
+    安全边界共三条：
+    1. 必须位于当前用户 Home 目录之下。
+    2. 不得指向丞相府自身目录（BASE_DIR），也不得是其上级或下级目录。
+    3. 不得与上述目录指向同一文件系统对象（大小写不敏感文件系统、
+       绑定挂载等造成的路径别名）。
     """
     path = project.get("path")
 
@@ -266,15 +325,38 @@ def safe_project_path(project):
 
     expanded = Path(path).expanduser().resolve()
 
-    # 安全边界：
-    # 当前只允许访问用户 Home 目录下的路径。
+    # 边界一：当前只允许访问用户 Home 目录下的路径。
     home = Path.home().resolve()
 
-    try:
-        expanded.relative_to(home)
-    except ValueError:
+    if not _path_is_within(expanded, home):
         raise PermissionError(
             "项目路径超出当前用户 Home 目录，拒绝读取。"
+        )
+
+    # 边界二：字面边界——丞相府自身目录及其祖先、子孙。
+    # BASE_DIR 在调用时读取模块全局，便于测试替换。
+    base = Path(BASE_DIR).resolve()
+
+    if _path_is_within(expanded, base) or _path_is_within(base, expanded):
+        raise PermissionError(
+            "项目路径不得指向丞相府自身目录，"
+            "也不得是包含丞相府目录的上级目录。"
+        )
+
+    # 边界三：别名边界。判定完成之后才抛，避免被任何 except OSError 吞掉。
+    expanded_id = _stat_identity(expanded)
+    alias_hit = False
+
+    if expanded_id is not None:
+        for candidate_dir in (base, *base.parents):
+            candidate_id = _stat_identity(candidate_dir)
+            if candidate_id is not None and candidate_id == expanded_id:
+                alias_hit = True
+                break
+
+    if alias_hit:
+        raise PermissionError(
+            "项目路径与丞相府目录或其上级目录指向同一文件系统对象，拒绝。"
         )
 
     return expanded
@@ -309,6 +391,67 @@ IGNORED_SEARCH_DIRS = {
     ".venv",
     "venv",
 }
+
+# ------------------------------------------------------------
+# 参数与备份的硬上限
+# ------------------------------------------------------------
+
+MAX_OLD_TEXT_CHARS = 200_000
+MAX_NEW_TEXT_CHARS = 2_000_000
+MAX_RELATIVE_PATH_CHARS = 4096
+MAX_SEARCH_KEYWORD_CHARS = 200
+MAX_BACKUP_ATTEMPTS = 5
+
+# modify_file 的输入上限：与 read_file 的整体读取上限保持一致。
+MAX_MODIFY_FILE_BYTES = 8 * 1024 * 1024
+MODIFY_READ_CHUNK_BYTES = 1024 * 1024
+
+
+def _read_bounded(fd, limit):
+    """从已打开的 fd 读取至多 limit 字节。
+
+    返回的 bytes 长度恒 <= limit；不做"先整体读入再判断"。
+    """
+    buffers = []
+    remaining = limit
+
+    while remaining > 0:
+        chunk = os.read(fd, min(remaining, MODIFY_READ_CHUNK_BYTES))
+        if not chunk:
+            break
+        buffers.append(chunk)
+        remaining -= len(chunk)
+
+    return b"".join(buffers)
+
+
+def _validate_text_arg(name, value, max_chars):
+    """校验字符串参数：类型、长度、NUL、UTF-8 可编码性。"""
+    if not isinstance(value, str):
+        raise ValueError(f"{name} 必须是字符串。")
+    if len(value) > max_chars:
+        raise ValueError(f"{name} 超出长度上限 {max_chars} 字符。")
+    if "\x00" in value:
+        raise ValueError(f"{name} 不得包含 NUL 字符。")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{name} 含无法编码为 UTF-8 的字符。") from exc
+
+
+def _validate_relative_path(value):
+    """校验项目内相对路径的字符串层面约束。"""
+    _validate_text_arg("relative_path", value, MAX_RELATIVE_PATH_CHARS)
+    if not value.strip():
+        raise PermissionError("拒绝空白或无效的目标路径。")
+
+
+def _validate_line_number(name, value):
+    """校验行号，并拒绝 bool 被当作整数行号（bool 是 int 的子类）。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} 必须是整数。")
+    if value < 1:
+        raise ValueError(f"{name} 必须 >= 1。")
 
 
 def is_forbidden_read(path):
@@ -359,13 +502,156 @@ def get_local_project_root(project_id):
     return path
 
 
+MAX_READ_FILE_BYTES = 8 * 1024 * 1024
+READ_CHUNK_BYTES = 64 * 1024
+MAX_SCAN_BYTES = 64 * 1024 * 1024
+MAX_SCAN_LINES = 200_000
+MAX_RETURN_LINES = 500
+
+
+def _read_line_range(target, relative_path, project_id,
+                     start_line, end_line, max_bytes):
+    """以固定大小二进制块逐行读取指定行范围。
+
+    不变量：
+    - 每次 read() 的实参恒为 READ_CHUNK_BYTES；
+    - buf 仅在"当前行位于请求范围内"时非空，且长度恒 <= max_bytes；
+    - 范围外的行完全不缓冲，只统计换行符；
+    - 任一项限额越界都抛受控 ValueError，绝不无限读取。
+
+    由于 buffering=0，read() 不做预读，scanned_bytes 是精确值。
+    """
+    collected = []
+    collected_bytes = 0
+    line_no = 0
+    scanned_bytes = 0
+    buf = bytearray()
+    skipping = False
+
+    with target.open("rb", buffering=0) as handle:
+        while True:
+            chunk = handle.read(READ_CHUNK_BYTES)
+            if not chunk:
+                break
+
+            scanned_bytes += len(chunk)
+            if scanned_bytes > MAX_SCAN_BYTES:
+                raise ValueError(
+                    f"扫描字节数超过上限 {MAX_SCAN_BYTES} bytes，已中止。"
+                    "请改用 search_project 定位。"
+                )
+
+            pos = 0
+            while pos < len(chunk):
+                in_range = start_line <= line_no + 1 <= end_line
+
+                if in_range:
+                    idx = chunk.find(b"\n", pos)
+                    end = len(chunk) if idx < 0 else idx
+
+                    # 扩写前预检：越过可返回预算即确定失败。
+                    remaining = max_bytes - collected_bytes
+                    if len(buf) + (end - pos) > remaining:
+                        raise ValueError(
+                            f"第 {line_no + 1} 行的可返回字节预算不足："
+                            f"已累积 {len(buf)} bytes，"
+                            f"本块将增加 {end - pos} bytes，"
+                            f"剩余预算 {remaining} bytes，已中止。"
+                        )
+
+                    buf.extend(chunk[pos:end])
+                    skipping = False
+
+                    if idx < 0:
+                        pos = len(chunk)
+                    else:
+                        line_no += 1
+                        if line_no > MAX_SCAN_LINES:
+                            raise ValueError(
+                                f"扫描行数超过上限 {MAX_SCAN_LINES} 行，已中止。"
+                            )
+                        text = (
+                            bytes(buf)
+                            .decode("utf-8", errors="replace")
+                            .rstrip("\r")
+                        )
+                        collected.append(text)
+                        collected_bytes += len(text.encode("utf-8")) + 1
+                        buf.clear()
+                        pos = idx + 1
+                else:
+                    idx = chunk.find(b"\n", pos)
+                    if idx < 0:
+                        pos = len(chunk)
+                        skipping = True
+                    else:
+                        line_no += 1
+                        if line_no > MAX_SCAN_LINES:
+                            raise ValueError(
+                                f"扫描行数超过上限 {MAX_SCAN_LINES} 行，已中止。"
+                            )
+                        skipping = False
+                        pos = idx + 1
+
+        # EOF：处理文件末尾没有换行符的最后一行。
+        if buf:
+            line_no += 1
+            if line_no > MAX_SCAN_LINES:
+                raise ValueError(
+                    f"扫描行数超过上限 {MAX_SCAN_LINES} 行，已中止。"
+                )
+            text = (
+                bytes(buf).decode("utf-8", errors="replace").rstrip("\r")
+            )
+            collected.append(text)
+            collected_bytes += len(text.encode("utf-8")) + 1
+        elif skipping:
+            line_no += 1
+            if line_no > MAX_SCAN_LINES:
+                raise ValueError(
+                    f"扫描行数超过上限 {MAX_SCAN_LINES} 行，已中止。"
+                )
+
+    total_lines = line_no
+
+    if start_line > total_lines:
+        raise ValueError(
+            f"start_line 超出文件范围：文件共 {total_lines} 行。"
+        )
+
+    end_line = min(end_line, total_lines)
+    result_content = "\n".join(collected)
+
+    if len(result_content.encode("utf-8")) > max_bytes:
+        raise ValueError(
+            f"指定行范围过大，单次最多返回 {max_bytes} bytes。"
+        )
+
+    return {
+        "project": project_id,
+        "status": "ok",
+        "file": relative_path,
+        "start_line": start_line,
+        "end_line": end_line,
+        "total_lines": total_lines,
+        "bytes": len(result_content.encode("utf-8")),
+        "content": result_content,
+    }
+
+
 def read_file(project_id, relative_path, start_line=None, end_line=None, max_bytes=30000):
     """
     精确读取项目内的单个文本文件。
     支持可选行范围：
     start_line / end_line 均为 1-based，包含首尾。
+
+    整体读取有 MAX_READ_FILE_BYTES 硬上限；
+    行范围读取采用固定块二进制读取、逐行处理，
+    同时限制扫描字节数、扫描行数、返回行数与返回字节数。
     """
     require_permission("read")
+
+    _validate_relative_path(relative_path)
 
     root = get_local_project_root(project_id)
 
@@ -404,22 +690,43 @@ def read_file(project_id, relative_path, start_line=None, end_line=None, max_byt
             f"目标不是普通文件：{relative_path}"
         )
 
+    size = target.stat().st_size
+
     if start_line is not None or end_line is not None:
         if start_line is None:
             start_line = 1
+
+        _validate_line_number("start_line", start_line)
+
         if end_line is None:
             end_line = start_line + 200
 
-        if not isinstance(start_line, int) or not isinstance(end_line, int):
-            raise ValueError("start_line 和 end_line 必须是整数。")
+        _validate_line_number("end_line", end_line)
 
-        if start_line < 1 or end_line < start_line:
+        if end_line < start_line:
             raise ValueError("行范围无效。")
 
-        if end_line - start_line + 1 > 500:
+        if end_line - start_line + 1 > MAX_RETURN_LINES:
             raise ValueError("单次最多读取 500 行。")
 
-    size = target.stat().st_size
+        return _read_line_range(
+            target, relative_path, project_id,
+            start_line, end_line, max_bytes,
+        )
+
+    # 整体读取：必须在读取之前完成大小校验。
+    if size > MAX_READ_FILE_BYTES:
+        raise ValueError(
+            f"文件过大：{relative_path} ({size} bytes)，"
+            f"超过整体读取上限 {MAX_READ_FILE_BYTES} bytes。"
+            "请改用 search_project 定位，或使用 start_line/end_line 分段读取。"
+        )
+
+    if size > max_bytes:
+        raise ValueError(
+            f"文件过大：{relative_path} ({size} bytes)，"
+            f"单次最多读取 {max_bytes} bytes。"
+        )
 
     try:
         content = target.read_text(
@@ -429,41 +736,6 @@ def read_file(project_id, relative_path, start_line=None, end_line=None, max_byt
     except OSError as e:
         raise RuntimeError(
             f"读取文件失败：{e}"
-        )
-
-    if start_line is not None or end_line is not None:
-        lines = content.splitlines()
-
-        if start_line > len(lines):
-            raise ValueError(
-                f"start_line 超出文件范围：文件共 {len(lines)} 行。"
-            )
-
-        end_line = min(end_line, len(lines))
-
-        selected = lines[start_line - 1:end_line]
-        result_content = "\n".join(selected)
-
-        if len(result_content.encode("utf-8")) > max_bytes:
-            raise ValueError(
-                f"指定行范围过大，单次最多返回 {max_bytes} bytes。"
-            )
-
-        return {
-            "project": project_id,
-            "status": "ok",
-            "file": relative_path,
-            "start_line": start_line,
-            "end_line": end_line,
-            "total_lines": len(lines),
-            "bytes": len(result_content.encode("utf-8")),
-            "content": result_content
-        }
-
-    if size > max_bytes:
-        raise ValueError(
-            f"文件过大：{relative_path} ({size} bytes)，"
-            f"单次最多读取 {max_bytes} bytes。"
         )
 
     return {
@@ -485,7 +757,10 @@ def search_project(project_id, keyword, max_results=50):
 
     root = get_local_project_root(project_id)
 
-    if not keyword:
+    # 入口再校验一次：必须在任何目录遍历之前完成类型与长度检查。
+    _validate_text_arg("keyword", keyword, MAX_SEARCH_KEYWORD_CHARS)
+
+    if not keyword.strip():
         raise ValueError("搜索关键词不能为空。")
 
     results = []
@@ -1047,6 +1322,31 @@ ALLOWED_MODIFY_TOOLS = {
 
 ALLOWED_TOOLS = ALLOWED_READ_TOOLS | ALLOWED_MODIFY_TOOLS
 
+# 工具参数键契约：只描述"键"，不描述值类型、长度或路径。
+# 注意：函数内部默认参数（read_file 的 max_bytes、search_project 的
+# max_results）不是计划参数，不得出现在这里。
+TOOL_ARG_SPEC = {
+    "read_project": {
+        "required": frozenset(),
+        "optional": frozenset(),
+    },
+    "read_file": {
+        "required": frozenset({"relative_path"}),
+        "optional": frozenset({"start_line", "end_line"}),
+    },
+    "search_project": {
+        "required": frozenset({"keyword"}),
+        "optional": frozenset(),
+    },
+    "modify_file": {
+        "required": frozenset({"relative_path", "old_text", "new_text"}),
+        "optional": frozenset(),
+    },
+}
+
+# 单份计划最多允许的修改类操作数：一次批准至多覆盖一次修改。
+MAX_MODIFY_OPS_PER_PLAN = 1
+
 CURRENT_TOOL_PLAN = []
 
 # Approval record; execution binding will be added in a later patch.
@@ -1072,17 +1372,58 @@ def plan_required_permission(plan):
         raise PermissionError("拒绝：工具计划为空或格式无效。")
 
     required = "read"
+    modify_ops = 0
     for item in plan:
         if not isinstance(item, dict):
             raise PermissionError("拒绝：计划条目格式无效。")
         name = item.get("name")
+
+        # 工具名称必须是字符串：不可哈希类型会让随后的集合判断抛 TypeError。
+        if not isinstance(name, str):
+            raise PermissionError(
+                f"拒绝：工具名称类型不合法（需要字符串）：{name!r}"
+            )
+
         if name in ALLOWED_READ_TOOLS:
             continue
         if name in ALLOWED_MODIFY_TOOLS:
+            modify_ops += 1
             required = "modify"
             continue
         raise PermissionError(f"拒绝未知工具：{name!r}")
+
+    if modify_ops > MAX_MODIFY_OPS_PER_PLAN:
+        raise PermissionError(
+            "拒绝：单份计划最多允许 "
+            f"{MAX_MODIFY_OPS_PER_PLAN} 个修改操作，实际 {modify_ops} 个。"
+        )
+
     return required
+
+
+def _check_arg_keys(name, args):
+    """执行器侧的参数键契约：只检查键，不检查值。
+
+    与解析器的键白名单保持一致，但独立实现，
+    使绕过解析器的计划同样会被拒绝。
+    """
+    spec = TOOL_ARG_SPEC.get(name)
+    if spec is None:
+        raise PermissionError(f"拒绝执行未知工具：{name!r}")
+
+    allowed = spec["required"] | spec["optional"]
+
+    extra = set(args) - allowed
+    if extra:
+        raise PermissionError(
+            f"工具 {name} 存在未经允许的参数：{extra}"
+        )
+
+    missing = spec["required"] - set(args)
+    if missing:
+        raise PermissionError(
+            f"工具 {name} 缺少必需参数：{missing}"
+        )
 
 
 def bind_plan_approval(plan, permission, source):
@@ -1111,9 +1452,61 @@ def bind_plan_approval(plan, permission, source):
     }
 
 
-def parse_tool_plan(content):
+_PRECHECK_FULL_READ_LIMIT = 30000
+
+
+def _precheck_whole_file_read(project, relative_path):
+    """计划层预检：整文件读取前对大文件早拒。
+
+    这不是授权边界，真正的边界在 read_file 内。
+    - safe_project_path 抛出的 PermissionError 原样冒泡，绝不吞掉。
+    - 项目未登记本地 path：静默跳过预检。
+    - 明确的无效路径 / 符号链接循环：安全降级为跳过。
+    - 其它 OSError：不吞，原样抛出。
+    """
+    root = safe_project_path(project)
+
+    if root is None:
+        return
+
+    try:
+        candidate = (root / relative_path).resolve()
+    except RuntimeError:
+        return
+    except OSError as exc:
+        # PermissionError 是 OSError 子类，但 errno 不是 ELOOP，
+        # 会落到下一行被重新抛出，不会被误吞。
+        if getattr(exc, "errno", None) == errno.ELOOP:
+            return
+        raise
+    except ValueError:
+        return
+
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return
+
+    if not candidate.is_file():
+        return
+
+    size = candidate.stat().st_size
+
+    if size > _PRECHECK_FULL_READ_LIMIT:
+        raise PermissionError(
+            f"文件过大：{relative_path} ({size} bytes)。"
+            f"超过 {_PRECHECK_FULL_READ_LIMIT} bytes，"
+            "必须使用 start_line/end_line 分段读取。"
+        )
+
+
+def parse_tool_plan(content, allowed_tools=None):
     global CURRENT_TOOL_PLAN
     CURRENT_TOOL_PLAN = []
+
+    allowed_names = (
+        ALLOWED_TOOLS if allowed_tools is None else set(allowed_tools)
+    )
 
     line = None
 
@@ -1132,6 +1525,10 @@ def parse_tool_plan(content):
         data = json.loads(line)
     except json.JSONDecodeError as e:
         raise ValueError(f"工具计划 JSON 错误：{e}")
+
+    # 顶层必须是 JSON 对象，否则 .get() 会抛 AttributeError。
+    if not isinstance(data, dict):
+        raise ValueError("工具计划顶层必须是 JSON 对象。")
 
     tools = data.get("tools", [])
 
@@ -1152,11 +1549,32 @@ def parse_tool_plan(content):
         project_id = item.get("project_id")
         args = item.get("args", {})
 
+        # 类型检查必须前移：先确认 name 是字符串、args 是字典，
+        # 之后才允许集合成员判断、args.keys() 与字段访问。
+        if not isinstance(name, str):
+            raise ValueError("工具计划的 name 必须是字符串。")
+
+        if not isinstance(args, dict):
+            raise ValueError("工具参数 args 必须是 JSON 对象。")
+
+        if not isinstance(project_id, str):
+            raise ValueError("工具计划的 project_id 必须是字符串。")
+
         if name not in ALLOWED_TOOLS:
             raise PermissionError(f"未知工具：{name}")
 
+        if name not in allowed_names:
+            raise PermissionError(
+                f"本轮计划不允许使用该工具：{name}"
+                "（当前阶段仅允许只读工具）"
+            )
+
+        # 参数键集合唯一来源：parser 与 executor 共用 TOOL_ARG_SPEC。
+        spec = TOOL_ARG_SPEC[name]
+        allowed = spec["required"] | spec["optional"]
+
         if name == "modify_file":
-            if set(args.keys()) != {"relative_path", "old_text", "new_text"}:
+            if set(args.keys()) != spec["required"]:
                 raise PermissionError(
                     "modify_file 参数必须且只能是：relative_path、old_text、new_text"
                 )
@@ -1168,62 +1586,28 @@ def parse_tool_plan(content):
                 f"项目未登记：{project_id}"
             )
 
-        if not isinstance(args, dict):
-            raise ValueError("工具参数格式错误。")
-
         if name == "read_project":
-            allowed = set()
+            pass
 
         elif name == "read_file":
-            allowed = {
-                "relative_path",
-                "start_line",
-                "end_line",
-            }
-
             if "relative_path" not in args:
                 raise ValueError("read_file 缺少 relative_path")
 
+            _validate_relative_path(args["relative_path"])
+
             # 中央硬规则：大文件禁止整文件读取，必须使用行范围。
             if "start_line" not in args and "end_line" not in args:
-                projects = load_projects()
                 project = projects.get(project_id)
-
-                if not project:
-                    raise PermissionError(
-                        f"未知项目：{project_id}"
+                if project:
+                    _precheck_whole_file_read(
+                        project, args["relative_path"]
                     )
-
-                project_path = project.get("path")
-
-                if project_path:
-                    target = (
-                        Path(project_path).expanduser()
-                        / args["relative_path"]
-                    )
-
-                    if target.exists() and target.is_file():
-                        size = target.stat().st_size
-
-                        if size > 30000:
-                            raise PermissionError(
-                                f"文件过大：{args['relative_path']} "
-                                f"({size} bytes)。"
-                                "超过 30000 bytes，"
-                                "必须使用 start_line/end_line 分段读取。"
-                            )
 
             if "start_line" in args:
-                if not isinstance(args["start_line"], int):
-                    raise ValueError("start_line 必须是整数")
-                if args["start_line"] < 1:
-                    raise ValueError("start_line 必须 >= 1")
+                _validate_line_number("start_line", args["start_line"])
 
             if "end_line" in args:
-                if not isinstance(args["end_line"], int):
-                    raise ValueError("end_line 必须是整数")
-                if args["end_line"] < 1:
-                    raise ValueError("end_line 必须 >= 1")
+                _validate_line_number("end_line", args["end_line"])
 
             if (
                 "start_line" in args
@@ -1235,16 +1619,29 @@ def parse_tool_plan(content):
                 )
 
         elif name == "modify_file":
-            allowed = {
-                "relative_path",
-                "old_text",
-                "new_text",
-            }
+            _validate_relative_path(args["relative_path"])
+            _validate_text_arg(
+                "old_text", args["old_text"], MAX_OLD_TEXT_CHARS
+            )
+            _validate_text_arg(
+                "new_text", args["new_text"], MAX_NEW_TEXT_CHARS
+            )
+
+            if args["old_text"] == "":
+                raise PermissionError(
+                    "禁止空 old_text 修改，防止误插入。"
+                )
 
         elif name == "search_project":
-            allowed = {"keyword"}
             if "keyword" not in args:
                 raise ValueError("search_project 缺少 keyword")
+
+            _validate_text_arg(
+                "keyword", args["keyword"], MAX_SEARCH_KEYWORD_CHARS
+            )
+
+            if not args["keyword"].strip():
+                raise ValueError("搜索关键词不能为空。")
 
         else:
             raise PermissionError(f"拒绝工具：{name}")
@@ -1274,15 +1671,399 @@ def show_tool_plan(plan):
     if not plan:
         print("本轮无需工具。")
     else:
+        read_count = 0
+        modify_count = 0
+
         for i, item in enumerate(plan, 1):
+            name = item["name"]
+
+            if name in ALLOWED_READ_TOOLS:
+                tag = "[只读]"
+                read_count += 1
+            else:
+                tag = "[修改]"
+                modify_count += 1
+
             print(
-                f"{i}. {item['name']}("
+                f"{i}. {tag} {name}("
                 f"{item['project_id']}, "
                 f"{json.dumps(item['args'], ensure_ascii=False)})"
             )
 
+            if name in ALLOWED_MODIFY_TOOLS:
+                target = item["args"].get("relative_path", "?")
+                print(
+                    f"    → 将先创建独立备份，再以原子替换写入新内容：{target}"
+                )
+
+        print("-" * 60)
+        print(
+            f"合计 {len(plan)} 项："
+            f"只读 {read_count} 项，修改 {modify_count} 项"
+        )
+
     print("=" * 60)
 
+
+
+def _make_backup_candidate(target, attempt=0):
+    """生成唯一备份候选路径；每次调用都取新的时间戳。
+
+    文件名形如：
+        bot.py.20250615T143012123456.before_chengxiang_modify.bak
+        bot.py.20250615T143012123456-1.before_chengxiang_modify.bak
+    后缀固定为 .bak，命中 .gitignore 中已有的 *.bak 规则。
+    """
+    stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S%f")
+    discriminator = "" if attempt == 0 else f"-{attempt}"
+    return target.with_name(
+        f"{target.name}.{stamp}{discriminator}"
+        ".before_chengxiang_modify.bak"
+    )
+
+
+def _make_partial_candidate(official_path):
+    """把正式备份路径映射为同名的 .partial 半成品路径。
+
+    例：a.txt.<stamp>.before_chengxiang_modify.bak
+     →  a.txt.<stamp>.before_chengxiang_modify.partial
+    """
+    name = official_path.name
+    if name.endswith(".bak"):
+        name = name[:-len(".bak")]
+    return official_path.with_name(name + ".partial")
+
+
+def _abandon_partial_backup(handle, backup):
+    """保留半成品备份：只关闭句柄并告警，绝不删除。
+
+    设计理由：POSIX 没有"按 inode 删除"的原子原语，任何按名字删除
+    都可能删到被替换进来的其它文件。因此本函数不存在任何删除操作。
+
+    handle 允许为 None（备份已发布、发布失败等阶段无可关闭句柄）。
+    """
+    closed = True
+    if handle is not None:
+        try:
+            handle.close()
+        except OSError:
+            closed = False
+
+    print(
+        "⚠️ 本次备份未完成，半成品已保留（不做自动清理）："
+        f"{backup}"
+    )
+    return "closed" if closed else "close_failed"
+
+
+class BackupPublishError(RuntimeError):
+    """备份发布失败：正式 .bak 未被创建，目标文件未被修改。"""
+
+
+class BackupDurabilityError(BackupPublishError):
+    """renameat2 已成功，但父目录 fsync 失败。
+
+    此时正式 .bak 可能已经存在（内容正确），只是"断电后是否仍存在"
+    无法确认。调用方不得删除它，也不得声称备份不存在。
+    """
+
+
+# Linux renameat2 标志位与 AT_FDCWD。
+RENAME_NOREPLACE = 1
+AT_FDCWD = -100
+
+# 这些 errno 表示"原语或权限不可用"，必须 fail-closed，禁止降级。
+_RENAMEAT2_FATAL_ERRNOS = frozenset(
+    code for code in (
+        getattr(errno, "ENOSYS", None),
+        getattr(errno, "EINVAL", None),
+        getattr(errno, "EOPNOTSUPP", None),
+        getattr(errno, "EPERM", None),
+        getattr(errno, "EACCES", None),
+    ) if code is not None
+)
+
+_renameat2_fn = None
+_renameat2_loaded = False
+
+
+def _load_renameat2():
+    """返回 libc 的 renameat2 调用；不可用时返回 None（调用方必须 fail-closed）。"""
+    global _renameat2_fn, _renameat2_loaded
+
+    if _renameat2_loaded:
+        return _renameat2_fn
+
+    _renameat2_loaded = True
+
+    if not hasattr(os, "uname") or os.uname().sysname != "Linux":
+        _renameat2_fn = None
+        return None
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        fn = libc.renameat2
+        fn.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        fn.restype = ctypes.c_int
+        _renameat2_fn = fn
+    except (OSError, AttributeError):
+        _renameat2_fn = None
+
+    return _renameat2_fn
+
+
+def _fsync_directory(directory, published_path):
+    """对目录执行 fsync，尽可能保证目录项持久化。
+
+    失败即抛 BackupDurabilityError：rename 已经成功，正式 .bak 可能已存在，
+    不得删除该文件，也不得声称备份不存在。
+    """
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+
+    try:
+        fd = os.open(directory, flags)
+    except OSError as exc:
+        raise BackupDurabilityError(
+            f"备份可能已发布为 {published_path}，但父目录无法打开做 fsync，"
+            f"持久性未确认：{directory}；{exc}"
+        ) from exc
+
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        raise BackupDurabilityError(
+            f"备份可能已发布为 {published_path}，但父目录 fsync 失败，"
+            f"持久性未确认：{directory}；{exc}"
+        ) from exc
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _verify_partial_identity(partial, identity):
+    """发布前复核：.partial 必须仍是本次创建并写入的那个普通文件。
+
+    使用 lstat，绝不跟随符号链接。任一条件不满足即 fail-closed：
+    不发布正式 .bak、不修改目标文件、不删除被替换的对象。
+    """
+    if identity is None:
+        raise BackupPublishError(
+            "备份发布失败（阶段：verify）：缺少 .partial 的身份记录，"
+            f"拒绝发布；现场保留：{partial}"
+        )
+
+    try:
+        info = os.lstat(partial)
+    except FileNotFoundError as exc:
+        raise BackupPublishError(
+            "备份发布失败（阶段：verify）：.partial 已不存在，"
+            f"拒绝发布；现场保留：{partial}"
+        ) from exc
+    except OSError as exc:
+        raise BackupPublishError(
+            "备份发布失败（阶段：verify）：无法检查 .partial 状态，"
+            f"拒绝发布；现场保留：{partial}；{exc}"
+        ) from exc
+
+    if stat.S_ISLNK(info.st_mode):
+        raise BackupPublishError(
+            "备份发布失败（阶段：verify）：.partial 已变成符号链接，"
+            f"拒绝发布（不跟随链接）；现场保留：{partial}"
+        )
+
+    if not stat.S_ISREG(info.st_mode):
+        raise BackupPublishError(
+            "备份发布失败（阶段：verify）：.partial 不再是普通文件，"
+            f"拒绝发布；现场保留：{partial}"
+        )
+
+    actual = (info.st_dev, info.st_ino)
+
+    if actual != identity:
+        raise BackupPublishError(
+            "备份发布失败（阶段：verify）：.partial 已被替换"
+            f"（期望 inode {identity}，实际 {actual}），"
+            f"拒绝发布；现场保留：{partial}"
+        )
+
+
+def _publish_backup(partial, target):
+    """用 Linux renameat2(RENAME_NOREPLACE) 把 .partial 严格发布为正式 .bak。
+
+    保证分层：
+    - "原子不覆盖"：由 RENAME_NOREPLACE 保证；目标已存在时内核返回 EEXIST，
+      本函数换下一个候选名重试，绝不覆盖。
+    - "断电后持久化"：由发布成功后的父目录 fsync 尽力保证；失败时抛
+      BackupDurabilityError，如实报告"可能已发布、持久性未确认"。
+    这两个是不同的保证，不可混为一谈。
+
+    原语或权限不可用（非 Linux / libc 无符号 / ENOSYS / EINVAL /
+    EOPNOTSUPP / EPERM / EACCES）时一律 fail-closed，绝不降级为
+    os.rename / os.replace。
+    """
+    fn = _load_renameat2()
+
+    if fn is None:
+        raise BackupPublishError(
+            "备份发布失败（阶段：publish）：当前平台不提供 "
+            "renameat2(RENAME_NOREPLACE)，拒绝发布；"
+            f"半成品已保留：{partial}"
+        )
+
+    for attempt in range(MAX_BACKUP_ATTEMPTS):
+        official = _make_backup_candidate(target, attempt)
+
+        ctypes.set_errno(0)
+        rc = fn(
+            AT_FDCWD,
+            os.fsencode(str(partial)),
+            AT_FDCWD,
+            os.fsencode(str(official)),
+            RENAME_NOREPLACE,
+        )
+
+        if rc == 0:
+            _fsync_directory(official.parent, official)
+            return official
+
+        err = ctypes.get_errno()
+
+        if err == errno.EEXIST:
+            continue
+
+        code = errno.errorcode.get(err, str(err))
+
+        if err in _RENAMEAT2_FATAL_ERRNOS:
+            raise BackupPublishError(
+                "备份发布失败（阶段：publish）：renameat2 返回 "
+                f"{code}，说明原语或权限不可用，拒绝降级；"
+                f"半成品已保留：{partial}"
+            )
+
+        raise BackupPublishError(
+            "备份发布失败（阶段：publish）：renameat2 返回 "
+            f"{code}；半成品已保留：{partial}"
+        )
+
+    raise BackupPublishError(
+        "备份发布失败（阶段：publish）："
+        f"{MAX_BACKUP_ATTEMPTS} 个候选备份名均已被占用；"
+        f"半成品已保留：{partial}"
+    )
+
+
+# 只有 ELOOP 表示"最终组件是符号链接 / 符号链接循环"。
+# 其它 errno（例如 EMLINK）必须走通用错误路径，不得误报为符号链接拒绝。
+_OPEN_NOFOLLOW_ERRNOS = frozenset(
+    code for code in (
+        getattr(errno, "ELOOP", None),
+    ) if code is not None
+)
+
+
+def _open_target_no_follow(target):
+    """以 O_NOFOLLOW 打开目标文件，拒绝最终路径组件是符号链接。
+
+    保护范围仅限**最终路径组件**：父目录组件中的符号链接由调用方的
+    "解析父目录 + target.relative_to(root)" 负责，不在本函数保证之内。
+
+    平台不提供 O_NOFOLLOW 时一律 fail-closed，绝不静默降级为普通打开。
+    最终组件是符号链接（或存在符号链接循环）时，内核返回 ELOOP，
+    这里统一转换为项目既有的安全拒绝错误 PermissionError。
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+
+    if nofollow is None:
+        raise PermissionError(
+            "当前平台不支持 O_NOFOLLOW，无法安全打开目标文件，"
+            "拒绝修改（fail-closed）。"
+        )
+
+    try:
+        return os.open(target, os.O_RDONLY | nofollow)
+    except OSError as exc:
+        if getattr(exc, "errno", None) in _OPEN_NOFOLLOW_ERRNOS:
+            raise PermissionError(
+                "拒绝修改：目标文件的最终路径组件是符号链接，"
+                f"或存在符号链接循环：{target}"
+            ) from exc
+        raise
+
+
+class TargetLockBusy(RuntimeError):
+    """同一目标文件已被另一个丞相实例锁定，本次修改放弃。"""
+
+
+class ModifyConflictError(RuntimeError):
+    """目标文件在处理过程中被外部替换，拒绝覆盖，已停止修改。"""
+
+
+def _lock_dir():
+    """锁目录位于仓库之外，随 HOME 变化（便于测试隔离）。"""
+    return Path.home() / ".local" / "state" / "chengxiang" / "locks"
+
+
+def _target_lock_path(target):
+    digest = hashlib.sha256(str(target).encode("utf-8")).hexdigest()
+    return _lock_dir() / f"{digest}.lock"
+
+
+def _acquire_target_lock(target):
+    """获取目标文件级排他锁（协作锁，跨丞相实例有效）。
+
+    非阻塞：拿不到立即失败，避免用户长时间卡住。
+    """
+    directory = _lock_dir()
+
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        raise RuntimeError(f"无法创建锁目录 {directory}：{exc}") from exc
+
+    path = _target_lock_path(target)
+    flags = os.O_RDWR | os.O_CREAT
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is not None:
+        flags |= nofollow
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    if cloexec is not None:
+        flags |= cloexec
+
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise RuntimeError(f"无法打开目标锁文件：{exc}") from exc
+
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise TargetLockBusy(
+            "目标文件正被另一个丞相实例修改，本次修改已放弃："
+            f"{target}"
+        )
+
+    return fd
+
+
+def _release_target_lock(fd):
+    """释放目标锁；任何失败都不得掩盖调用方的异常。"""
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
 
 
 def modify_file(project_id, relative_path, old_text, new_text):
@@ -1291,10 +2072,24 @@ def modify_file(project_id, relative_path, old_text, new_text):
     - 必须拥有 modify 权限
     - 只能操作已登记项目
     - 禁止 .env / 密钥 / Git 文件
-    - 修改前自动备份
+    - 拒绝 setuid/setgid 特殊权限文件
+    - 修改前自动创建独立备份，成功后保留
     - 必须精确匹配 old_text，防止误改
+    - 全程按字节读写，不做编码或换行转换
     """
     require_permission("modify")
+
+    # 参数校验必须在任何文件系统访问之前完成。
+    _validate_relative_path(relative_path)
+
+    if not isinstance(old_text, str) or not isinstance(new_text, str):
+        raise PermissionError("old_text 与 new_text 必须是字符串。")
+
+    _validate_text_arg("old_text", old_text, MAX_OLD_TEXT_CHARS)
+    _validate_text_arg("new_text", new_text, MAX_NEW_TEXT_CHARS)
+
+    if old_text == "":
+        raise PermissionError("禁止空 old_text 修改，防止误插入。")
 
     try:
         get_registered_project(project_id)
@@ -1302,9 +2097,6 @@ def modify_file(project_id, relative_path, old_text, new_text):
         raise PermissionError(f"未知项目：{project_id}") from exc
 
     from pathlib import PurePosixPath, PureWindowsPath
-
-    if not isinstance(relative_path, str) or not relative_path.strip():
-        raise PermissionError("拒绝空白或无效的目标路径。")
 
     normalized = relative_path.replace("\\", "/").strip()
     posix_path = PurePosixPath(normalized)
@@ -1344,7 +2136,11 @@ def modify_file(project_id, relative_path, old_text, new_text):
         raise PermissionError(
             f"项目 {project_id} 没有可用的本地工作区：{exc}"
         ) from exc
-    target = (root / normalized).resolve()
+    # 只解析父目录，保留最终组件的原始名字：
+    # 若把最终组件也 resolve 掉，"它本身是符号链接"这一事实会被抹去，
+    # O_NOFOLLOW 就无从判断。父目录的解析仍用于 relative_to 越界防护。
+    parent = (root / normalized).parent.resolve()
+    target = parent / Path(normalized).name
 
     try:
         target.relative_to(root)
@@ -1363,16 +2159,101 @@ def modify_file(project_id, relative_path, old_text, new_text):
                 f"中央禁止修改敏感目标：{relative_path}"
             )
 
-    if not target.exists() or not target.is_file():
+    # 从这里开始进入受锁保护的主体：读取、备份、复核、替换全部串行化。
+    lock_fd = _acquire_target_lock(target)
+    try:
+        return _modify_file_locked(
+            target, project_id, relative_path, old_text, new_text
+        )
+    finally:
+        _release_target_lock(lock_fd)
+
+
+def _modify_file_locked(target, project_id, relative_path, old_text, new_text):
+    """在已持有目标锁的前提下执行修改主体。"""
+    # 用 lstat 检查最终组件本身：符号链接在这里就被拒绝（不跟随），
+    # 而不是先跟随、再判断目标是否为普通文件。
+    try:
+        target_lstat = os.lstat(target)
+    except FileNotFoundError:
         raise FileNotFoundError(f"目标文件不存在：{relative_path}")
 
-    if old_text == "":
-        raise PermissionError("禁止空 old_text 修改，防止误插入。")
+    if stat.S_ISLNK(target_lstat.st_mode):
+        raise PermissionError(
+            "拒绝修改：目标文件本身是符号链接（不做跟随）："
+            f"{relative_path}"
+        )
 
-    content = target.read_text()
-    # 记录读取时的内容指纹，用于发现并发修改。
-    import hashlib
-    original_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    if not stat.S_ISREG(target_lstat.st_mode):
+        raise ValueError(f"目标不是普通文件：{relative_path}")
+
+    # 用同一个已打开的描述符完成"身份 / 类型 / 特殊权限 / 大小 / 内容"检查，
+    # 避免 stat 与 read 之间的竞态（检查的对象必须就是被读取的对象）。
+    try:
+        source_fd = _open_target_no_follow(target)
+    except PermissionError:
+        raise
+    except OSError as exc:
+        raise RuntimeError(
+            f"打开目标文件失败（阶段：open）：{relative_path}；{exc}"
+        ) from exc
+
+    try:
+        target_stat = os.fstat(source_fd)
+
+        if not stat.S_ISREG(target_stat.st_mode):
+            raise ValueError(f"目标不是普通文件：{relative_path}")
+
+        # 特殊权限检查：必须早于备份创建与文件读取。
+        if target_stat.st_mode & (stat.S_ISUID | stat.S_ISGID):
+            raise PermissionError(
+                "拒绝修改带有 setuid/setgid 特殊权限的文件："
+                f"{relative_path}"
+            )
+
+        if target_stat.st_size > MAX_MODIFY_FILE_BYTES:
+            raise ValueError(
+                f"文件过大：{relative_path} ({target_stat.st_size} bytes)，"
+                f"超过修改上限 {MAX_MODIFY_FILE_BYTES} bytes，拒绝修改。"
+            )
+
+        # 有界读取：最多读 MAX_MODIFY_FILE_BYTES + 1 字节，
+        # 即使文件在 fstat 之后继续增长也不会突破上限。
+        original_bytes = _read_bounded(
+            source_fd, MAX_MODIFY_FILE_BYTES + 1
+        )
+    except BaseException:
+        # 有异常在飞：关闭失败不得覆盖它，原始异常原样上抛。
+        try:
+            os.close(source_fd)
+        except OSError:
+            pass
+        raise
+    else:
+        os.close(source_fd)
+
+    if len(original_bytes) > MAX_MODIFY_FILE_BYTES:
+        raise ValueError(
+            f"文件过大：{relative_path}，读取量已超过修改上限 "
+            f"{MAX_MODIFY_FILE_BYTES} bytes，拒绝修改。"
+        )
+
+    original_mode = stat.S_IMODE(target_stat.st_mode)
+    # 备份权限只保留 rwx，清除 setuid/setgid/sticky。
+    # 按位与只能清除位，因此备份权限恒不宽于原文件。
+    backup_mode = original_mode & 0o777
+
+    # 严格 UTF-8 解码，避免按 locale 静默重编码。
+    try:
+        content = original_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"拒绝修改非 UTF-8 文本文件：{relative_path}"
+            f"（偏移 {exc.start} 处解码失败）。"
+        ) from exc
+
+    # 记录读取时的字节指纹，用于发现并发修改。
+    original_hash = hashlib.sha256(original_bytes).hexdigest()
 
     count = content.count(old_text)
 
@@ -1384,49 +2265,83 @@ def modify_file(project_id, relative_path, old_text, new_text):
             f"找到 {count} 处匹配，无法确认唯一修改位置，未修改文件。"
         )
 
-    backup = target.with_name(
-        target.name + ".before_chengxiang_modify.bak"
-    )
+    # 独立备份，分两阶段：
+    #   阶段一：以 .partial 名义独占创建并完整写入；失败时绝不冒充正式备份。
+    #   阶段二：renameat2(RENAME_NOREPLACE) 严格发布为正式 .bak；
+    #           目标已存在时内核返回 EEXIST，换名重试，绝不覆盖。
+    backup = None
+    partial = None
+    partial_handle = None
 
-    # lexists 能识别断开的符号链接，不能只依赖 exists。
-    import os
+    for attempt in range(MAX_BACKUP_ATTEMPTS):
+        candidate = _make_backup_candidate(target, attempt)
+        partial_candidate = _make_partial_candidate(candidate)
+        try:
+            partial_handle = partial_candidate.open("xb")
+        except FileExistsError:
+            continue
+        backup = candidate
+        partial = partial_candidate
+        break
 
-    if os.path.lexists(backup):
-        raise FileExistsError(
-            f"安全停止：备份路径已存在或被占用，请先人工确认：{backup}"
+    if partial_handle is None:
+        raise RuntimeError(
+            f"连续 {MAX_BACKUP_ATTEMPTS} 次无法生成唯一 .partial 备份文件名，"
+            "未修改任何文件。"
         )
 
-    # 独占创建备份，拒绝覆盖已存在的路径。
-    backup_created = False
+    # backup_ready 之后，正式备份已发布，不存在任何删除它的路径。
+    backup_ready = False
+    partial_identity = None
     try:
-        with backup.open("x", encoding="utf-8") as backup_file:
-            backup_created = True
-            backup_file.write(content)
-            backup_file.flush()
-            os.fsync(backup_file.fileno())
-    except FileExistsError:
-        raise FileExistsError(
-            f"安全停止：备份路径已被占用，请先人工确认：{backup}"
-        )
-    except BaseException as original_error:
-        if backup_created:
+        # 记录本次创建的 .partial 身份，发布前必须仍然是它。
+        created_stat = os.fstat(partial_handle.fileno())
+        partial_identity = (created_stat.st_dev, created_stat.st_ino)
+        # 先定权限再写内容，消除"宽权限 + 已含内容"的时间窗。
+        os.fchmod(partial_handle.fileno(), backup_mode)
+        partial_handle.write(original_bytes)
+        partial_handle.flush()
+        os.fsync(partial_handle.fileno())
+    except BaseException as exc:
+        # 不自动删除半成品：按名字删除可能删到被替换进来的文件。
+        status = _abandon_partial_backup(partial_handle, partial)
+        if hasattr(exc, "add_note"):
             try:
-                backup.unlink()
-            except OSError as cleanup_error:
-                raise RuntimeError(
-                    "备份写入失败，且清理残留备份失败。"
-                    f"请人工检查：{backup}；清理错误：{cleanup_error}"
-                ) from original_error
+                exc.add_note(
+                    "备份写入阶段失败，半成品以 .partial 保留"
+                    "（未发布为正式备份）："
+                    f"{partial}（状态：{status}）"
+                )
+            except Exception:
+                pass
         raise
+    else:
+        partial_handle.close()
+
+    # 阶段二：先复核 .partial 身份，再用 renameat2(RENAME_NOREPLACE) 发布。
+    try:
+        _verify_partial_identity(partial, partial_identity)
+        official = _publish_backup(partial, target)
+    except BackupDurabilityError:
+        # rename 已成功：正式 .bak 可能已存在，只是持久性未确认。
+        # 不删除、不否认，原样上报，由调用方决定。
+        raise
+    except BackupPublishError:
+        _abandon_partial_backup(None, partial)
+        raise
+
+    backup = official
+    backup_ready = True
 
     new_content = content.replace(old_text, new_text, 1)
 
-    # 同目录临时文件：完整写入后再替换正式文件。
-    import os
-    import tempfile
-    import stat
+    # 防御性不变量：没有已发布的完整备份就绝不进入替换阶段。
+    if not backup_ready:
+        raise RuntimeError(
+            "内部不变量被破坏：缺少已发布的完整备份，拒绝替换目标文件。"
+        )
 
-    original_mode = stat.S_IMODE(target.stat().st_mode)
+    # 同目录临时文件：完整写入后再替换正式文件。
     temp_path = None
 
     try:
@@ -1437,22 +2352,60 @@ def modify_file(project_id, relative_path, old_text, new_text):
         )
         temp_path = Path(temp_name)
 
-        with os.fdopen(fd, "w", encoding="utf-8") as temp_file:
-            temp_file.write(new_content)
-            temp_file.flush()
-            os.fsync(temp_file.fileno())
+        # closefd=False：fd 的所有权始终留在本函数；文件对象只负责
+        # 缓冲写入 / flush / fsync，绝不代劳关闭，因此不依赖
+        # os.fdopen 失败时是否已由内部对象关闭（属实现细节）。
+        try:
+            with os.fdopen(fd, "wb", closefd=False) as temp_file:
+                temp_file.write(new_content.encode("utf-8"))
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+        except BaseException:
+            # 有异常在飞：关闭失败不得覆盖原始异常。
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        else:
+            os.close(fd)          # 正常路径：关闭失败必须向上传播
 
         os.chmod(temp_path, original_mode)
 
-        # 替换前复核内容；若文件已变化，拒绝覆盖。
-        current_content = target.read_text()
-        current_hash = hashlib.sha256(
-            current_content.encode("utf-8")
-        ).hexdigest()
-        if current_hash != original_hash:
+        # 替换前按字节复核；若文件已变化（含超出读取上限），拒绝覆盖。
+        check_fd = _open_target_no_follow(target)
+        try:
+            # 身份复核：内容相同但 inode 已变，说明文件被换过（原子保存），
+            # 单靠 SHA-256 无法发现这种替换。
+            check_stat = os.fstat(check_fd)
+            if (check_stat.st_dev, check_stat.st_ino) != (
+                target_stat.st_dev,
+                target_stat.st_ino,
+            ):
+                raise ModifyConflictError(
+                    "安全停止：目标文件在读取后被替换（inode 变化），"
+                    f"拒绝覆盖。完整备份已保留：{backup}"
+                )
+            current_bytes = _read_bounded(
+                check_fd, MAX_MODIFY_FILE_BYTES + 1
+            )
+        except BaseException:
+            # 有异常在飞：关闭失败不得覆盖它，原始异常原样上抛。
+            try:
+                os.close(check_fd)
+            except OSError:
+                pass
+            raise
+        else:
+            os.close(check_fd)
+
+        if (
+            len(current_bytes) > MAX_MODIFY_FILE_BYTES
+            or hashlib.sha256(current_bytes).hexdigest() != original_hash
+        ):
             raise RuntimeError(
                 "安全停止：目标文件在读取后发生变化，拒绝覆盖。"
-                f"原始备份保留：{backup}"
+                f"完整备份已保留：{backup}"
             )
 
         os.replace(temp_path, target)
@@ -1549,6 +2502,10 @@ def execute_tool_plan(plan):
     if not isinstance(plan, list) or not plan:
         raise PermissionError("拒绝执行：计划为空或格式无效。")
 
+    # 与解析器保持一致的数量上限；位于审计与任何工具分发之前。
+    if len(plan) > 20:
+        raise PermissionError("拒绝执行：单轮工具超过 20 个。")
+
     try:
         fingerprint = tool_plan_fingerprint(plan)
     except (TypeError, ValueError):
@@ -1576,6 +2533,13 @@ def execute_tool_plan(plan):
         if not {"name", "project_id", "args"}.issubset(item):
             raise PermissionError("拒绝执行：计划条目缺少必要字段。")
 
+        project_id = item["project_id"]
+        if not isinstance(project_id, str):
+            raise PermissionError(
+                "拒绝执行：project_id 类型不合法（需要字符串）："
+                f"{project_id!r}"
+            )
+
         name = item["name"]
         if name in ALLOWED_READ_TOOLS:
             required = "read"
@@ -1586,18 +2550,27 @@ def execute_tool_plan(plan):
 
         if not isinstance(item["args"], dict):
             raise PermissionError("拒绝执行：工具参数必须为对象。")
+
+        _check_arg_keys(name, item["args"])
+
         if permission_level(approved_permission) < permission_level(required):
             raise PermissionError(
                 f"拒绝执行：批准权限不足，工具 {name!r} 需要 {required}。"
             )
 
     source_name = approval.get("source", "human")
-    audit_event(
-        "execution_started",
-        permission=approved_permission,
-        source=source_name,
-        status="started",
-    )
+    try:
+        audit_event(
+            "execution_started",
+            permission=approved_permission,
+            source=source_name,
+            status="started",
+        )
+    except Exception as exc:
+        # 审计失败必须终止：此时尚未分发任何工具，保持 fail-closed。
+        raise RuntimeError(
+            f"执行前审计写入失败，已终止本次执行：{type(exc).__name__}"
+        ) from exc
 
     results = []
 
@@ -1783,22 +2756,33 @@ def execute_tool_plan(plan):
 # 人类审批入口
 # ============================================================
 
-def approval_flow():
+def _normalize_approval(text):
+    """手机输入常带中文标点，统一去掉首尾空白与标点再判断。"""
+    return str(text or "").strip().strip("。.！!？?，,、；;：: \t")
+
+
+def approval_flow(prefilled=None):
     """
     当前版本仍采用人工批准。
     不允许 DeepSeek 自己决定批准。
+
+    prefilled：主循环已经收到的答复（如「准奏 read」）。
+    非空时直接采用，不再重复询问。
     """
     global STATE, CURRENT_TOOL_PLAN
 
-    print()
-    print("🔐 中央审批")
-    print("输入：")
-    print("  准奏 read")
-    print("  准奏 modify")
-    print("  驳回")
-    print()
+    answer = _normalize_approval(prefilled)
 
-    answer = input("👑 圣裁：> ").strip()
+    if not answer:
+        print()
+        print("🔐 中央审批")
+        print("输入：")
+        print("  准奏 read")
+        print("  准奏 modify")
+        print("  驳回")
+        print()
+
+        answer = _normalize_approval(input("👑 圣裁：> "))
 
     if answer == "退出":
         clear_authorization()
@@ -1828,10 +2812,8 @@ def approval_flow():
                 "🛑 授权格式错误。"
                 "例如：准奏 read"
             )
-            clear_authorization()
-            CURRENT_TOOL_PLAN = []
-            STATE = "IDLE"
-            reset_current_task()
+            # 保留待批准计划，允许皇帝重新输入，不销毁已有成果。
+            print("ℹ️ 待批准计划已保留，可重新输入「准奏 read」。")
             return None
 
         permission = parts[1]
@@ -1840,10 +2822,7 @@ def approval_flow():
             print(
                 f"🛑 未知权限：{permission}"
             )
-            clear_authorization()
-            CURRENT_TOOL_PLAN = []
-            STATE = "IDLE"
-            reset_current_task()
+            print("ℹ️ 待批准计划已保留，可重新输入「准奏 read」。")
             return None
 
         if not isinstance(CURRENT_TOOL_PLAN, list) or not CURRENT_TOOL_PLAN:
@@ -1923,6 +2902,8 @@ def execute_read_test(plan):
     try:
         require_permission("read")
 
+        # 刻意保留的独立第二道只读检查：不复用 ALLOWED_READ_TOOLS，
+        # 以免上游集合被误改时同时失去两道门。
         read_only_tools = {
             "read_project",
             "read_file",
@@ -2011,10 +2992,17 @@ def main():
     print("输入“退出”结束。")
     print()
 
+    history_text = ""
+
     while True:
         command = input(
             "👑 陛下：> "
         ).strip()
+        command = _normalize_approval(command)
+
+        # 新任务下达时清空历轮分析；批准命令则保留，以便后续轮次接续上下文。
+        if not command.strip().lower().startswith("准奏") and command.strip().lower() != "驳回":
+            history_text = ""
 
         if command.strip().lower() == "退出":
             clear_authorization()
@@ -2026,7 +3014,7 @@ def main():
                 print("🔐 当前没有待批准的中央调度单，不能直接执行授权。请先下达具体任务。")
                 continue
 
-            permission = approval_flow()
+            permission = approval_flow(command)
 
             if permission == "退出":
                 break
@@ -2045,6 +3033,12 @@ def main():
                 )
 
                 followup_prompt = f"""
+皇帝最初下达的任务是：
+{command}
+
+你在此之前各轮已经取得的分析结论（避免重复已读过的内容）：
+{history_text or "（这是第一轮）"}
+
 上一轮你已经根据皇帝圣旨制定了只读工具计划。
 中央权限层已经批准并执行了该计划。
 
@@ -2068,7 +3062,8 @@ TOOL_PLAN_JSON: {{"tools":[]}}
                     followup_prompt,
                     thinking_enabled=False
                 )
-                next_plan = parse_tool_plan(analysis)
+                history_text += f"\n--- 新一轮分析 ---\n{analysis}"
+                next_plan = parse_tool_plan(analysis, allowed_tools=ALLOWED_READ_TOOLS)
                 show_tool_plan(next_plan)
 
                 if next_plan:
@@ -2198,14 +3193,14 @@ TOOL_PLAN_JSON: {{"tools":[]}}
 
             # 低风险任务仅允许绑定并执行纯只读计划。
             # 所有工具计划均须经过人工审批；风险判断不能授予权限。
-            permission = approval_flow()
+            permission = approval_flow(command)
 
             if permission == "退出":
                 break
 
             if permission == "read":
-                # 中央权限层已授予 read；执行前确保状态机进入执行态。
-                STATE = "AUTHORIZED"
+                # 授权状态已由 approval_flow() 在审批成功时置为 AUTHORIZED，
+                # 此处不再重复写入。
                 results = execute_read_test(plan)
 
                 print()
@@ -2220,6 +3215,12 @@ TOOL_PLAN_JSON: {{"tools":[]}}
                 )
 
                 followup_prompt = f"""
+皇帝最初下达的任务是：
+{command}
+
+你在此之前各轮已经取得的分析结论（避免重复已读过的内容）：
+{history_text or "（这是第一轮）"}
+
 上一轮你已经根据皇帝圣旨制定了只读工具计划。
 中央权限层已经批准并执行了该计划。
 
@@ -2251,8 +3252,9 @@ TOOL_PLAN_JSON: {{"tools":[]}}
 """
 
                 analysis = call_deepseek(followup_prompt, thinking_enabled=False)
+                history_text += f"\n--- 新一轮分析 ---\n{analysis}"
 
-                next_plan = parse_tool_plan(analysis)
+                next_plan = parse_tool_plan(analysis, allowed_tools=ALLOWED_READ_TOOLS)
                 show_tool_plan(next_plan)
 
                 if next_plan:
