@@ -178,5 +178,23 @@ class ApprovalFlowBranchTests(ChengxiangTestBase):
         self.assertEqual((self.project / "a.txt").read_bytes(), b"hello\n")
 
 
+class ApprovalWiringTests(ChengxiangTestBase):
+    """守卫：两个调用点必须各司其职。
+
+    审批分支应把用户已输入的「准奏 xxx」透传给 approval_flow(command)，
+    避免二次询问；正常任务流必须调用 approval_flow() 让皇帝当场裁决。
+    若两者写反，会出现「圣裁无效」或「重复询问」。
+    """
+
+    def test_call_sites_are_wired_correctly(self):
+        from pathlib import Path
+
+        src = Path(main.__file__).read_text(encoding="utf-8")
+        self.assertEqual(
+            src.count("permission = approval_flow(command)"), 1
+        )
+        self.assertEqual(src.count("permission = approval_flow()"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

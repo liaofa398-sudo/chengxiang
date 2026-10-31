@@ -3193,7 +3193,7 @@ TOOL_PLAN_JSON: {{"tools":[]}}
 
             # 低风险任务仅允许绑定并执行纯只读计划。
             # 所有工具计划均须经过人工审批；风险判断不能授予权限。
-            permission = approval_flow(command)
+            permission = approval_flow()
 
             if permission == "退出":
                 break
